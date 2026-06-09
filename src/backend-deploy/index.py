@@ -530,7 +530,7 @@ def _init_db():
     if not xm:
         conn.execute(
             "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("xiaoming", "xiaoming@qq.com", "13600001111", generate_password_hash("123456"), "account", "approved",
+            ("xiaoming", "xiaoming@qq.com", "13600001111", generate_password_hash("Xiaoyu1!"), "account", "approved",
              datetime.now().isoformat()[:19])
         )
         xm_id = _last_row_id(conn, "users")

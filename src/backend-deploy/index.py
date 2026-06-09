@@ -2399,13 +2399,10 @@ def generate():
         settings = conn3.execute("SELECT channel_id FROM user_settings WHERE user_id=?", (uid,)).fetchone()
         ch_id = settings["channel_id"] if settings else None
         if ch_id:
-            # model 可能是 API 格式 (doubao-seedance-2-0-720p)，提取基础模型名
-            base_model = model
-            if resolution and model.endswith('-' + resolution.lower()):
-                base_model = model[:-len('-' + resolution.lower())]
+            # model 已是基础模型名，直接用 resolution 匹配
             pricing = conn3.execute(
                 "SELECT selling_price FROM channel_model_pricing WHERE channel_id=? AND model_name=? AND resolution=?",
-                (ch_id, base_model, resolution)
+                (ch_id, model, resolution)
             ).fetchone()
             sp = float(pricing["selling_price"]) if pricing and pricing["selling_price"] else 0
             if sp <= 0:
@@ -2422,12 +2419,12 @@ def generate():
             who = "主账号" if owner_id else "您"
             return jsonify({"code": 402, "message": f"积分不足！需要 {cost} 积分，{who}当前只有 {current_points} 积分"}), 402
 
-        # 获取渠道信息 — 按基础模型名匹配正确渠道
+        # 获取渠道信息 — 按模型名匹配渠道
         model_ch = conn3.execute(
             "SELECT ch.id, ch.name, ch.base_url, ch.api_key FROM channels ch "
             "JOIN channel_model_pricing cmp ON cmp.channel_id = ch.id "
             "WHERE cmp.model_name=? AND ch.status='active' LIMIT 1",
-            (base_model,)
+            (model,)
         ).fetchone()
         if model_ch:
             channel_info = dict(model_ch)
@@ -2441,15 +2438,11 @@ def generate():
     else:
         # 未登录也按模型匹配渠道
         conn_fb = _get_db()
-        # model 含分辨率后缀时提取基础名
-        fb_base = model
-        if resolution and model.endswith('-' + resolution.lower()):
-            fb_base = model[:-len('-' + resolution.lower())]
         model_ch = conn_fb.execute("""
             SELECT ch.id, ch.name, ch.base_url, ch.api_key FROM channels ch
             JOIN channel_model_pricing cmp ON cmp.channel_id = ch.id
             WHERE cmp.model_name=? AND ch.status='active' LIMIT 1
-        """, (fb_base,)).fetchone()
+        """, (model,)).fetchone()
         if model_ch:
             channel_info = dict(model_ch)
         else:

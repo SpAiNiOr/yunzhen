@@ -657,8 +657,7 @@ function doGenerate(){
   if(!model) return toast('请先选择模型','error');
   if(duration<4||duration>60) return toast('视频时长需在4-60秒之间','error');
   const pps=selectedPrice||0;
-  const apiModel = selectedResolution ? model + '-' + selectedResolution.toLowerCase() : model;
-  if(!confirm('确认生成？\n\n模型：'+apiModel+'\n时长：'+duration+'秒\n预估消耗：'+Math.round(duration*pps)+' 积分\n\n积分将在生成前扣除，生成失败请联系客服。')) return;
+  if(!confirm('确认生成？\n\n模型：'+model+' (清晰度：'+selectedResolution+')\n时长：'+duration+'秒\n预估消耗：'+Math.round(duration*pps)+' 积分\n\n积分将在生成前扣除，生成失败请联系客服。')) return;
 
   // 先开始进度条
   startProgress(selectedResolution);
@@ -669,7 +668,7 @@ function doGenerate(){
 
   const btn=document.getElementById('btn-gen'); btn.disabled=true; btn.textContent='⏳ 提交中...';
 
-  var genBody={model:apiModel,text:prompt,duration:duration,resolution:selectedResolution,ratio:document.getElementById('aspect-ratio').value};
+  var genBody={model:model,text:prompt,duration:duration,resolution:selectedResolution,ratio:document.getElementById('aspect-ratio').value};
   if(genMode==='image' && uploadedImageUrl) genBody.image_url=uploadedImageUrl;
   // 视频生视频
   if(genMode==='video'){

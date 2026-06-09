@@ -1811,20 +1811,28 @@ def api_users():
     if sp_filter:
         users = conn.execute("""
             SELECT u.id, u.username, u.email, u.phone, u.role, u.status, u.owner_id, u.created_at,
-                   COALESCE(sp.name, '') AS sales_name, sp.id AS sales_id
+                   COALESCE(sp.name, '') AS sales_name, sp.id AS sales_id,
+                   COALESCE(ub.balance, 0) AS balance,
+                   COALESCE(ub.points, 0) AS points,
+                   COALESCE(ub.total_deposit, 0) AS total_deposit
             FROM users u
             JOIN sales_customer sc ON sc.user_id = u.id
             JOIN sales sp ON sp.id = sc.sales_id
+            LEFT JOIN user_balance ub ON ub.user_id = u.id
             WHERE sc.sales_id = ?
             ORDER BY u.id
         """, (sp_filter,)).fetchall()
     else:
         users = conn.execute("""
             SELECT u.id, u.username, u.email, u.phone, u.role, u.status, u.owner_id, u.created_at,
-                   COALESCE(sp.name, '') AS sales_name, sp.id AS sales_id
+                   COALESCE(sp.name, '') AS sales_name, sp.id AS sales_id,
+                   COALESCE(ub.balance, 0) AS balance,
+                   COALESCE(ub.points, 0) AS points,
+                   COALESCE(ub.total_deposit, 0) AS total_deposit
             FROM users u
             LEFT JOIN sales_customer sc ON sc.user_id = u.id
             LEFT JOIN sales sp ON sp.id = sc.sales_id
+            LEFT JOIN user_balance ub ON ub.user_id = u.id
             ORDER BY u.id
         """).fetchall()
     conn.close()

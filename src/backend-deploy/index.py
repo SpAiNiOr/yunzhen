@@ -59,7 +59,7 @@ def _assign_request_id():
 # 数据库（支持 SQLite 本地 + PostgreSQL 生产）
 # ============================================================
 DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
-DATABASE_URL = os.environ.get("DATABASE_URL") or "postgresql://yunzhen_db_user:9RjVZ0xXTlLdQSrjBQQr9IR2VtOXfrdC@dpg-d8ihmigjo6nc73da0vfg-a.oregon-postgres.render.com/yunzhen_db"
+DATABASE_URL = os.environ.get("DATABASE_URL") or "postgresql://yunzhen_db_h2cu_user:SowFGdyiHJDhtXrfVYPw6HyzuU3mzfAy@dpg-d8jqoa9kh4rs73eetm20-a/yunzhen_db_h2cu"
 USE_PG = False  # 本地 SQLite
 
 def _get_db():
@@ -432,7 +432,7 @@ def _init_db():
     if not admin:
         conn.execute(
             "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("admin", "admin@aigongchang.com", "13800000000", generate_password_hash("admin123"), "admin", "approved",
+            ("admin", "admin@aigongchang.com", "13800000000", generate_password_hash("Yuzheng1!"), "admin", "approved",
              datetime.now().isoformat()[:19])
         )
         admin_id = conn.execute("SELECT id FROM users WHERE role='admin'").fetchone()["id"]
@@ -469,12 +469,29 @@ def _init_db():
     elif GOGO_API_KEY:
         conn.execute("UPDATE channels SET api_key=?, base_url=? WHERE id=?", (GOGO_API_KEY, "https://gogogotoken.com/v1", ch2["id"]))
 
+    # --- 默认定价（百度云） ---
+    ch2_id = conn.execute("SELECT id FROM channels WHERE name='百度云'").fetchone()["id"]
+    default_pricing = [
+        ("doubao-seedance-2-0", "480p", 0.462, 0.518),
+        ("doubao-seedance-2-0", "720p", 0.995, 1.11),
+        ("doubao-seedance-2-0", "1080p", 2.478, 2.78),
+    ]
+    for mname, res, cost, sell in default_pricing:
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_model_pricing (channel_id, model_name, resolution, cost_price, selling_price, points_per_second) VALUES (?, ?, ?, ?, ?, ?)",
+            (ch2_id, mname, res, cost, sell, max(1, int(round(sell))))
+        )
+    # 存量数据同步
+    conn.execute(
+        "UPDATE channel_model_pricing SET selling_price = points_per_second WHERE selling_price = 0"
+    )
+
     # 示例销售员（初始化数据 + 创建对应用户账号）
     sp_data = [
-        ("张经理", "abc123", "13900000001"),
-        ("李经理", "xyz789", "13900000002"),
+        ("张经理", "abc123", "13900000001", "Testsales1!"),
+        ("李经理", "xyz789", "13900000002", "Testsale2!"),
     ]
-    for sp_name, sp_code, sp_phone in sp_data:
+    for sp_name, sp_code, sp_phone, sp_pw in sp_data:
         sp = conn.execute("SELECT id, user_id FROM sales WHERE code=?", (sp_code,)).fetchone()
         if not sp:
             # 为销售员创建用户账号
@@ -482,7 +499,7 @@ def _init_db():
             conn.execute(
                 "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (sp_username, f"{sp_code}@aigongchang.com", sp_phone,
-                 generate_password_hash("888888"), "sales", "approved",
+                 generate_password_hash(sp_pw), "sales", "approved",
                  datetime.now().isoformat()[:19])
             )
             sp_user_id = _last_row_id(conn, "users")
@@ -537,7 +554,7 @@ def _init_db():
     if not zw:
         conn.execute(
             "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("zhangwei", "zhangwei@qq.com", "13700000001", generate_password_hash("123456"), "account", "approved",
+            ("zhangwei", "zhangwei@qq.com", "13700000001", generate_password_hash("Yuzhuu1!"), "account", "approved",
              datetime.now().isoformat()[:19])
         )
         zw_id = _last_row_id(conn, "users")
@@ -554,6 +571,23 @@ def _init_db():
             conn.execute(
                 "INSERT OR IGNORE INTO sales_customer (sales_id, user_id, created_at) VALUES (?, ?, ?)",
                 (sp1["id"], zw_id, datetime.now().isoformat()[:19])
+            )
+
+    # --- xiaoming 子账户 lisa ---
+    ls = conn.execute("SELECT id FROM users WHERE username='lisa'").fetchone()
+    if not ls:
+        # 确保 xiaoming 先存在
+        xm = conn.execute("SELECT id FROM users WHERE username='xiaoming'").fetchone()
+        if xm:
+            conn.execute(
+                "INSERT INTO users (username, email, phone, password, role, status, owner_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("lisa", "lisa@qq.com", "13800002222", generate_password_hash("Test123!"), "user", "approved",
+                 xm["id"], datetime.now().isoformat()[:19])
+            )
+            ls_id = _last_row_id(conn, "users")
+            conn.execute(
+                "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)",
+                (ls_id,)
             )
 
     conn.commit()

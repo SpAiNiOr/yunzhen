@@ -657,7 +657,7 @@ function doGenerate(){
   if(!model) return toast('请先选择模型','error');
   if(duration<4||duration>60) return toast('视频时长需在4-60秒之间','error');
   const pps=selectedPrice||0;
-  if(!confirm('确认生成？\n\n模型：'+model+' (清晰度：'+selectedResolution+')\n时长：'+duration+'秒\n预估消耗：'+Math.round(duration*pps)+' 积分\n\n积分将在生成前扣除，生成失败请联系客服。')) return;
+  if(!confirm('确认生成？\n\n模型：'+model+' (清晰度：'+selectedResolution+')\n时长：'+duration+'秒\n预估消耗：'+Math.round(duration*pps)+' 积分\n\n积分会在确认收到请求之后扣除，如果有任何问题请联系客服！')) return;
 
   // 先开始进度条
   startProgress(selectedResolution);

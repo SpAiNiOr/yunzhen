@@ -1,0 +1,14 @@
+.claude/
+backup/
+.superpowers/
+__pycache__/
+*.pyc
+*.db
+uploads/
+venv/
+.DS_Store
+src/video-api-proxy/
+src/video-website/
+src/netlify-deploy/
+config/
+docs/superpowers/

@@ -1,0 +1,3158 @@
+"""
+AI算力平台 — 后端服务
+首页 + 用户认证 + AI视频生成代理
+"""
+import os, sys, json, uuid, time, logging, sqlite3, re, hashlib, hmac, base64
+from datetime import datetime, timedelta
+from functools import wraps
+
+import requests
+from flask import Flask, request, jsonify, send_from_directory, session, redirect, Response
+from werkzeug.security import check_password_hash
+def generate_password_hash(password):
+    from werkzeug.security import generate_password_hash as _gph
+    return _gph(password, method='pbkdf2:sha256')
+from waitress import serve
+
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+logger = logging.getLogger("api-b")
+
+# ============================================================
+# Flask 初始化
+# ============================================================
+app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
+app.json.ensure_ascii = False  # Flask 3.x 用这个
+app.secret_key = os.environ.get("SECRET_KEY", uuid.uuid4().hex)
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = False
+
+_BASE = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(_BASE, "frontend")
+if not os.path.isdir(FRONTEND_DIR):
+    FRONTEND_DIR = os.path.join(_BASE, "..", "video-website")
+if not os.path.isdir(FRONTEND_DIR):
+    FRONTEND_DIR = _BASE  # 最后回退：同目录
+
+# CORS + Request ID 中间件
+@app.after_request
+def _cors_headers(response):
+    origin = request.headers.get("Origin", "")
+    allowed = ["http://localhost:9000", "http://localhost:3000", "http://localhost:5173",
+               "https://yunzhen.netlify.app"]
+    if origin in allowed or "netlify.app" in origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Request-Id"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    # 每个请求分配唯一 request_id
+    req_id = getattr(request, "request_id", str(uuid.uuid4())[:8])
+    response.headers["X-Request-Id"] = req_id
+    return response
+
+@app.before_request
+def _assign_request_id():
+    request.request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())[:8]
+    logger.info("[%s] %s %s", request.request_id, request.method, request.path)
+
+# ============================================================
+# 数据库（支持 SQLite 本地 + PostgreSQL 生产）
+# ============================================================
+DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
+DATABASE_URL = os.environ.get("DATABASE_URL") or "postgresql://yunzhen_db_user:9RjVZ0xXTlLdQSrjBQQr9IR2VtOXfrdC@dpg-d8ihmigjo6nc73da0vfg-a.oregon-postgres.render.com/yunzhen_db"
+USE_PG = False  # 本地 SQLite
+
+def _get_db():
+    """获取数据库连接（SQLite 或 PostgreSQL）"""
+    if USE_PG:
+        import psycopg
+        conn = psycopg.connect(DATABASE_URL)
+        conn.autocommit = True
+        # Monkey-patch: PG 兼容 SQLite 接口（psycopg3 原生支持 conn.execute）
+        _orig_exec = conn.execute
+        class _PGCursorWrapper:
+            def __init__(self, cur):
+                self.cur = cur
+                self.lastrowid = None
+            def fetchone(self):
+                try:
+                    row = self.cur.fetchone()
+                    if row is None: return None
+                    if isinstance(row, dict): return row
+                    cols = [d[0] for d in self.cur.description]
+                    return dict(zip(cols, row))
+                except: return None
+            def fetchall(self):
+                try:
+                    rows = self.cur.fetchall()
+                    if not rows: return []
+                    if isinstance(rows[0], dict): return rows
+                    cols = [d[0] for d in self.cur.description]
+                    return [dict(zip(cols, r)) for r in rows]
+                except: return []
+            def close(self): pass
+        def _pg_execute(sql, params=()):
+            sql = re.sub(r'\?', '%s', str(sql))
+            # CREATE TABLE → PG兼容
+            if sql.strip().upper().startswith("CREATE TABLE"):
+                sql = sql.replace("AUTOINCREMENT", "")
+                sql = sql.replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
+                sql = sql.replace("SERIAL PRIMARY KEY NOT NULL", "SERIAL PRIMARY KEY")
+            m = re.match(r"INSERT OR REPLACE INTO\s+(\w+)\s*\((.+?)\)\s*VALUES\s*\((.+?)\)", sql, re.I | re.S)
+            if m:
+                tbl, cols, vals = m.group(1), m.group(2), m.group(3)
+                pk = _PG_PK.get(tbl, "id")
+                col_list = [c.strip() for c in cols.split(",")]
+                pk_cols = [c.strip() for c in pk.split(",")]
+                update_cols = [c + " = EXCLUDED." + c for c in col_list if c not in pk_cols]
+                if update_cols:
+                    sql = "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s" % (tbl, cols, vals, pk, ", ".join(update_cols))
+                else:
+                    sql = "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO NOTHING" % (tbl, cols, vals, pk)
+            m = re.match(r"INSERT OR IGNORE INTO\s+(\w+)\s*\((.+?)\)\s*VALUES\s*\((.+?)\)", sql, re.I | re.S)
+            if m:
+                tbl, cols, vals, pk = m.group(1), m.group(2), m.group(3), _PG_PK.get(m.group(1), "id")
+                sql = "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO NOTHING" % (tbl, cols, vals, pk)
+            if sql.strip().upper().startswith("ALTER TABLE") and "ADD COLUMN" in sql.upper():
+                sql = re.sub(r"ALTER TABLE\s+(\w+)\s+ADD COLUMN", r"ALTER TABLE \1 ADD COLUMN IF NOT EXISTS", sql, flags=re.I)
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, params)
+                return _PGCursorWrapper(cur)
+            except Exception as e:
+                logger.error("PG SQL Error: %s | %s", str(e)[:200], sql[:200])
+                raise
+        conn.execute = _pg_execute
+        return conn
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def _last_row_id(conn, table):
+    """获取最后插入的ID（PG兼容）"""
+    if USE_PG:
+        pk = _PG_PK.get(table, "id")
+        if "," in pk:
+            return 0
+        row = conn.execute("SELECT MAX(" + pk + ") AS id FROM " + table).fetchone()
+        return row["id"] if row and row.get("id") else 0
+    cur = conn.execute("SELECT last_insert_rowid() AS id")
+    row = cur.fetchone()
+    return row["id"] if isinstance(row, dict) else row[0]
+
+_PG_PK = {
+    "users": "id", "user_balance": "user_id", "user_settings": "user_id",
+    "sales": "id", "sales_customer": "user_id",
+    "channels": "id", "channel_model_pricing": "channel_id, model_name",
+    "videos": "id", "recharge_records": "id", "points_usage_records": "id",
+    "tasks": "id", "usage_records": "id", "user_channel_usage": "id",
+    "customer_allowed_models": "id", "transactions": "id",
+}
+
+def _init_db():
+    conn = _get_db()
+    # 用户表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            username    TEXT    UNIQUE NOT NULL,
+            email       TEXT    NOT NULL,
+            phone       TEXT    NOT NULL DEFAULT '',
+            password    TEXT    NOT NULL,
+            role        TEXT    NOT NULL DEFAULT 'account',
+            status      TEXT    NOT NULL DEFAULT 'pending',
+            owner_id   INTEGER,
+            created_at  TEXT    NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES users(id)
+        )
+    """)
+    # 兼容已有数据库：尝试加 owner_id 列
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN owner_id INTEGER REFERENCES users(id)")
+    except:
+        pass
+    # 销售员表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sales (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            name        TEXT    NOT NULL,
+            code        TEXT    UNIQUE NOT NULL,
+            phone       TEXT    DEFAULT '',
+            created_at  TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    # 销售员 ↔ 客户关联表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sales_customer (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            sales_id  INTEGER NOT NULL,
+            user_id         INTEGER NOT NULL,
+            created_at      TEXT    NOT NULL,
+            FOREIGN KEY (sales_id) REFERENCES sales(id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id)
+        )
+    """)
+    # 渠道表（AI网关渠道，管理员管理）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT    UNIQUE NOT NULL,
+            base_url    TEXT    NOT NULL,
+            api_key     TEXT    NOT NULL DEFAULT '',
+            status      TEXT    NOT NULL DEFAULT 'active',
+            created_at  TEXT    NOT NULL
+        )
+    """)
+    # 用户设置表（记住用户偏好）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id         INTEGER PRIMARY KEY,
+            selected_model  TEXT DEFAULT '',
+            rate_per_second REAL DEFAULT 2.30,
+            channel_id      INTEGER,
+            updated_at      TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (channel_id) REFERENCES channels(id)
+        )
+    """)
+    # 兼容已有数据库：尝试加 channel_id 列
+    try:
+        conn.execute("ALTER TABLE user_settings ADD COLUMN channel_id INTEGER")
+    except:
+        pass
+    # 账户余额表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_balance (
+            user_id             INTEGER PRIMARY KEY,
+            balance             REAL    NOT NULL DEFAULT 0,
+            total_deposit       REAL    NOT NULL DEFAULT 0,
+            total_used          REAL    NOT NULL DEFAULT 0,
+            points              INTEGER NOT NULL DEFAULT 0,
+            total_points_used   INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    # 兼容已有数据库
+    try:
+        conn.execute("ALTER TABLE user_balance ADD COLUMN total_points_used INTEGER NOT NULL DEFAULT 0")
+    except:
+        pass
+    # 积分使用记录表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS points_usage_records (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            points_used     INTEGER NOT NULL,
+            balance_after   INTEGER NOT NULL,
+            model_name      TEXT    DEFAULT '',
+            duration        INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    # 客户可用模型表（销售员管理客户能用哪些模型）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS customer_allowed_models (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            model_name      TEXT    NOT NULL,
+            channel_id      INTEGER NOT NULL,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, model_name)
+        )
+    """)
+    # 交易记录表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            type            TEXT    NOT NULL,
+            amount          REAL    NOT NULL,
+            balance_after   REAL    NOT NULL,
+            description     TEXT    DEFAULT '',
+            created_at      TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    # 充值记录表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recharge_records (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            amount          REAL    NOT NULL,
+            balance_before  REAL    NOT NULL,
+            balance_after   REAL    NOT NULL,
+            created_by      INTEGER NOT NULL,
+            description     TEXT    DEFAULT '',
+            created_at      TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        )
+    """)
+    # 用量明细表（每次API调用记录）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS usage_records (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            channel_id      INTEGER,
+            seconds_used    REAL    NOT NULL DEFAULT 0,
+            tokens_used     INTEGER NOT NULL DEFAULT 0,
+            request_text    TEXT    DEFAULT '',
+            created_at      TEXT    NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (channel_id) REFERENCES channels(id)
+        )
+    """)
+    # 渠道用量汇总表（user + channel 维度，实时累加）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_channel_usage (
+            user_id         INTEGER NOT NULL,
+            channel_id      INTEGER NOT NULL,
+            total_seconds   REAL    NOT NULL DEFAULT 0,
+            synced_seconds  REAL    NOT NULL DEFAULT 0,
+            last_synced_at  TEXT    DEFAULT '',
+            PRIMARY KEY (user_id, channel_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (channel_id) REFERENCES channels(id)
+        )
+    """)
+    # 渠道-模型积分定价表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS channel_model_pricing (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id          INTEGER NOT NULL,
+            model_name          TEXT    NOT NULL,
+            resolution          TEXT    NOT NULL DEFAULT '',
+            points_per_second   INTEGER NOT NULL DEFAULT 10,
+            FOREIGN KEY (channel_id) REFERENCES channels(id),
+            UNIQUE(channel_id, model_name, resolution)
+        )
+    """)
+
+    # 视频库表（持久化，重启不丢失）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS videos (
+            id          TEXT    PRIMARY KEY,
+            name        TEXT    NOT NULL DEFAULT '',
+            url         TEXT    NOT NULL,
+            is_remote   INTEGER NOT NULL DEFAULT 0,
+            owner_id    INTEGER NOT NULL,
+            prompt_text TEXT    DEFAULT '',
+            model_name  TEXT    DEFAULT '',
+            duration    INTEGER DEFAULT 0,
+            category    TEXT    DEFAULT '',
+            created_at  TEXT    NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES users(id)
+        )
+    """)
+    # 兼容已有数据库：添加新列
+    for col in ["prompt_text", "model_name", "duration", "category"]:
+        try:
+            conn.execute("ALTER TABLE videos ADD COLUMN %s TEXT DEFAULT ''" % col)
+        except:
+            pass
+    try:
+        conn.execute("ALTER TABLE videos ADD COLUMN duration INTEGER DEFAULT 0")
+    except:
+        pass
+    # 兼容已有数据库：channel_model_pricing 新增 cost_price / selling_price 列
+    try:
+        conn.execute("ALTER TABLE channel_model_pricing ADD COLUMN cost_price REAL DEFAULT 0")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE channel_model_pricing ADD COLUMN selling_price REAL DEFAULT 0")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE channel_model_pricing ADD COLUMN resolution TEXT DEFAULT ''")
+    except:
+        pass
+    # PostgreSQL: 更新唯一约束为 (channel_id, model_name, resolution)
+    if USE_PG:
+        try:
+            conn.execute("ALTER TABLE channel_model_pricing DROP CONSTRAINT IF EXISTS channel_model_pricing_channel_id_model_name_key")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE channel_model_pricing ADD CONSTRAINT channel_model_pricing_uniq UNIQUE (channel_id, model_name, resolution)")
+        except:
+            pass
+    # 任务持久化表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id              TEXT    PRIMARY KEY,
+            remote_task_id  TEXT    DEFAULT '',
+            model           TEXT    DEFAULT '',
+            prompt_text     TEXT    DEFAULT '',
+            status          TEXT    DEFAULT 'queued',
+            video_url       TEXT    DEFAULT '',
+            channel_name    TEXT    DEFAULT '',
+            query_url_path  TEXT    DEFAULT '',
+            owner_id        INTEGER DEFAULT 0,
+            username        TEXT    DEFAULT '',
+            baidu_status    TEXT    DEFAULT '',
+            baidu_progress  INTEGER DEFAULT 0,
+            created_at      REAL    NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES users(id)
+        )
+    """)
+
+    # API 请求日志表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS request_logs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            username    TEXT    DEFAULT '',
+            action      TEXT    NOT NULL,
+            frontend_request   TEXT DEFAULT '',
+            backend_request    TEXT DEFAULT '',
+            backend_response   TEXT DEFAULT '',
+            response    TEXT    DEFAULT '',
+            status_code INTEGER DEFAULT 0,
+            duration_ms INTEGER DEFAULT 0,
+            created_at  TEXT    NOT NULL
+        )
+    """)
+    # 兼容已有数据库：request_logs 新增字段
+    for col in ["frontend_request", "backend_request", "backend_response"]:
+        try:
+            conn.execute(f"ALTER TABLE request_logs ADD COLUMN {col} TEXT DEFAULT ''")
+        except:
+            pass
+
+    # --- 初始化默认数据 ---
+
+    # 默认管理员
+    admin = conn.execute("SELECT id FROM users WHERE role='admin'").fetchone()
+    if not admin:
+        conn.execute(
+            "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("admin", "admin@aigongchang.com", "13800000000", generate_password_hash("admin123"), "admin", "approved",
+             datetime.now().isoformat()[:19])
+        )
+        admin_id = conn.execute("SELECT id FROM users WHERE role='admin'").fetchone()["id"]
+        # 给管理员也创建余额记录
+        conn.execute(
+            "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)",
+            (admin_id,)
+        )
+        conn.execute(
+            "INSERT INTO user_settings (user_id, selected_model, updated_at) VALUES (?, '', ?)",
+            (admin_id, datetime.now().isoformat()[:19])
+        )
+
+    # 默认渠道：天翼云
+    ch = conn.execute("SELECT * FROM channels WHERE name='天翼云'").fetchone()
+    if not ch:
+        conn.execute(
+            "INSERT INTO channels (name, base_url, api_key, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("天翼云", "https://ai.ctaigw.cn/v1", CTYUN_API_KEY, "active",
+             datetime.now().isoformat()[:19])
+        )
+    elif CTYUN_API_KEY and not ch["api_key"]:
+        # 已有渠道但没有 Key，从环境变量填充
+        conn.execute("UPDATE channels SET api_key=? WHERE id=?", (CTYUN_API_KEY, ch["id"]))
+
+    # 默认渠道：百度云（gogogotoken.com）
+    ch2 = conn.execute("SELECT * FROM channels WHERE name='百度云'").fetchone()
+    if not ch2:
+        conn.execute(
+            "INSERT INTO channels (name, base_url, api_key, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("百度云", "https://gogogotoken.com/v1", GOGO_API_KEY, "active",
+             datetime.now().isoformat()[:19])
+        )
+    elif GOGO_API_KEY:
+        conn.execute("UPDATE channels SET api_key=?, base_url=? WHERE id=?", (GOGO_API_KEY, "https://gogogotoken.com/v1", ch2["id"]))
+
+    # 示例销售员（初始化数据 + 创建对应用户账号）
+    sp_data = [
+        ("张经理", "abc123", "13900000001"),
+        ("李经理", "xyz789", "13900000002"),
+    ]
+    for sp_name, sp_code, sp_phone in sp_data:
+        sp = conn.execute("SELECT id, user_id FROM sales WHERE code=?", (sp_code,)).fetchone()
+        if not sp:
+            # 为销售员创建用户账号
+            sp_username = "sales_" + sp_code
+            conn.execute(
+                "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sp_username, f"{sp_code}@aigongchang.com", sp_phone,
+                 generate_password_hash("888888"), "sales", "approved",
+                 datetime.now().isoformat()[:19])
+            )
+            sp_user_id = _last_row_id(conn, "users")
+            conn.execute(
+                "INSERT INTO sales (user_id, name, code, phone, created_at) VALUES (?, ?, ?, ?, ?)",
+                (sp_user_id, sp_name, sp_code, sp_phone, datetime.now().isoformat()[:19])
+            )
+            conn.execute(
+                "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)",
+                (sp_user_id,)
+            )
+            conn.execute(
+                "INSERT INTO user_settings (user_id, selected_model, rate_per_second, updated_at) VALUES (?, '', 2.30, ?)",
+                (sp_user_id, datetime.now().isoformat()[:19])
+            )
+
+    # 天翼云/百度云统一定价已在上方处理，不再添加旧模型
+    # --- 默认定价（百度云渠道） ---
+    ch2_id = conn.execute("SELECT id FROM channels WHERE name='百度云'").fetchone()["id"]
+
+    # 将存量 points_per_second 同步到 selling_price（兼容已有数据库）
+    conn.execute(
+        "UPDATE channel_model_pricing SET selling_price = points_per_second WHERE selling_price = 0"
+    )
+
+    # --- 固定测试客户 xiaoming ---
+    xm = conn.execute("SELECT id FROM users WHERE username='xiaoming'").fetchone()
+    if not xm:
+        conn.execute(
+            "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("xiaoming", "xiaoming@qq.com", "13600001111", generate_password_hash("123456"), "account", "approved",
+             datetime.now().isoformat()[:19])
+        )
+        xm_id = _last_row_id(conn, "users")
+        conn.execute(
+            "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)",
+            (xm_id,)
+        )
+        conn.execute(
+            "INSERT INTO user_settings (user_id, selected_model, rate_per_second, channel_id, updated_at) VALUES (?, '', 2.30, 2, ?)",
+            (xm_id, datetime.now().isoformat()[:19])
+        )
+        sp1 = conn.execute("SELECT id FROM sales WHERE code='abc123'").fetchone()
+        if sp1:
+            conn.execute(
+                "INSERT OR IGNORE INTO sales_customer (sales_id, user_id, created_at) VALUES (?, ?, ?)",
+                (sp1["id"], xm_id, datetime.now().isoformat()[:19])
+            )
+
+    # --- 固定测试客户 zhangwei ---
+    zw = conn.execute("SELECT id FROM users WHERE username='zhangwei'").fetchone()
+    if not zw:
+        conn.execute(
+            "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("zhangwei", "zhangwei@qq.com", "13700000001", generate_password_hash("123456"), "account", "approved",
+             datetime.now().isoformat()[:19])
+        )
+        zw_id = _last_row_id(conn, "users")
+        conn.execute(
+            "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)",
+            (zw_id,)
+        )
+        conn.execute(
+            "INSERT INTO user_settings (user_id, selected_model, rate_per_second, channel_id, updated_at) VALUES (?, '', 2.30, 2, ?)",
+            (zw_id, datetime.now().isoformat()[:19])
+        )
+        sp1 = conn.execute("SELECT id FROM sales WHERE code='abc123'").fetchone()
+        if sp1:
+            conn.execute(
+                "INSERT OR IGNORE INTO sales_customer (sales_id, user_id, created_at) VALUES (?, ?, ?)",
+                (sp1["id"], zw_id, datetime.now().isoformat()[:19])
+            )
+
+    conn.commit()
+    conn.close()
+
+
+def _log_request(username, action, frontend_req=None, backend_req=None, backend_resp=None, response_data=None, status_code=0, duration_ms=0):
+    """记录 API 请求日志到数据库"""
+    try:
+        conn = _get_db()
+        fe_str = json.dumps(frontend_req, ensure_ascii=False, default=str)[:8000] if frontend_req else ""
+        be_req_str = json.dumps(backend_req, ensure_ascii=False, default=str)[:8000] if backend_req else ""
+        be_resp_str = json.dumps(backend_resp, ensure_ascii=False, default=str)[:8000] if backend_resp else ""
+        resp_str = json.dumps(response_data, ensure_ascii=False, default=str)[:8000] if response_data else ""
+        conn.execute(
+            "INSERT INTO request_logs (username, action, frontend_request, backend_request, backend_response, response, status_code, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (username or "", action, fe_str, be_req_str, be_resp_str, resp_str, status_code, duration_ms, datetime.now().isoformat()[:19])
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("日志写入失败: %s", e)
+
+
+# ============================================================
+# 天翼云配置（必须在 _init_db 之前定义，因为初始化需要用到）
+# ============================================================
+CTYUN_BASE_URL = os.environ.get("CTYUN_BASE_URL", "https://ai.ctaigw.cn/v1")
+CTYUN_API_KEY  = os.environ.get("CTYUN_API_KEY") or "sk-Rfl9XtGXDMsXp2iQz80ETaRdYFW"
+GOGO_API_KEY   = os.environ.get("GOGO_API_KEY") or "sk-Clk3nNk0zildPHTGmDfNz3P3s11dEQbwWc9IIrEhgYQuaAZE"
+
+_init_db()
+
+def _ctyun_headers():
+    return {"Authorization": f"Bearer {CTYUN_API_KEY}", "Content-Type": "application/json"}
+
+# ============================================================
+# 视频/任务内存存储
+# ============================================================
+_video_store = []
+_task_store  = {}
+
+# ============================================================ #
+#                        认证装饰器                               #
+# ============================================================ #
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            return jsonify({"code": 401, "message": "请先登录"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            return jsonify({"code": 401, "message": "请先登录"}), 401
+        if session.get("role") != "admin":
+            return jsonify({"code": 403, "message": "需要管理员权限"}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+def sales_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            return jsonify({"code": 401, "message": "请先登录"}), 401
+        if session.get("role") != "sales":
+            return jsonify({"code": 403, "message": "需要销售员权限"}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+# ============================================================ #
+#                    销售员 API                                   #
+# ============================================================ #
+
+@app.route("/api/sales/dashboard", methods=["GET"])
+@sales_required
+def api_sales_dashboard():
+    uid = session["user_id"]
+    conn = _get_db()
+
+    # 销售员信息
+    sp = conn.execute(
+        "SELECT id, name, code, phone FROM sales WHERE user_id=?", (uid,)
+    ).fetchone()
+    if not sp:
+        conn.close()
+        return jsonify({"code": 404, "message": "销售员信息不存在"}), 404
+
+    # 统计：客户数、客户累计充值
+    stats = conn.execute("""
+        SELECT
+            COUNT(DISTINCT sc.user_id) AS customer_count,
+            COALESCE(SUM(ub.total_deposit), 0) AS total_deposits
+        FROM sales_customer sc
+        JOIN user_balance ub ON ub.user_id = sc.user_id
+        WHERE sc.sales_id = ?
+    """, (sp["id"],)).fetchone()
+
+    # 客户列表（只列主账号 + 子账号数）
+    customers = conn.execute("""
+        SELECT
+            u.id, u.username, u.email, u.phone, u.status, u.created_at,
+            ub.balance, ub.total_deposit, ub.total_used, ub.points,
+            us.rate_per_second, us.channel_id,
+            COALESCE(ch.name, '') AS channel_name,
+            (SELECT COUNT(*) FROM users WHERE owner_id = u.id) AS sub_count
+        FROM sales_customer sc
+        JOIN users u ON u.id = sc.user_id
+        LEFT JOIN user_balance ub ON ub.user_id = u.id
+        LEFT JOIN user_settings us ON us.user_id = u.id
+        LEFT JOIN channels ch ON ch.id = us.channel_id
+        WHERE sc.sales_id = ? AND u.owner_id IS NULL
+        ORDER BY u.created_at DESC
+    """, (sp["id"],)).fetchall()
+
+    conn.close()
+    return jsonify({
+        "code": 0,
+        "sales": dict(sp),
+        "stats": {
+            "customer_count": stats["customer_count"] if stats else 0,
+            "total_deposits": stats["total_deposits"] if stats else 0.0,
+        },
+        "customers": [dict(c) for c in customers],
+    })
+
+
+@app.route("/api/sales/customer/<int:customer_id>/sub-accounts", methods=["GET"])
+@sales_required
+def api_sales_customer_subs(customer_id):
+    """获取客户下的子账号列表"""
+    conn = _get_db()
+    subs = conn.execute("""
+        SELECT u.id, u.username, u.email, u.phone, u.status, u.created_at,
+               ub.points, ub.balance, ub.total_deposit, ub.total_used, ub.total_points_used,
+               us.rate_per_second, us.channel_id,
+               COALESCE(ch.name, '') AS channel_name
+        FROM users u
+        LEFT JOIN user_balance ub ON ub.user_id = u.id
+        LEFT JOIN user_settings us ON us.user_id = u.id
+        LEFT JOIN channels ch ON ch.id = us.channel_id
+        WHERE u.owner_id = ?
+        ORDER BY u.created_at DESC
+    """, (customer_id,)).fetchall()
+    conn.close()
+    return jsonify({"code": 0, "sub_accounts": [dict(s) for s in subs]})
+
+
+@app.route("/api/sales/customer/<int:customer_id>/usage", methods=["GET"])
+@sales_required
+def api_sales_customer_usage(customer_id):
+    """获取客户用量统计：总秒数 + 各渠道秒数"""
+    conn = _get_db()
+
+    # 本地统计：总秒数
+    total = conn.execute(
+        "SELECT COALESCE(SUM(total_seconds), 0) AS s FROM user_channel_usage WHERE user_id=?", (customer_id,)
+    ).fetchone()
+    total_seconds = total["s"] if total else 0.0
+
+    # 各渠道秒数明细
+    channels_usage = conn.execute("""
+        SELECT ucu.channel_id, COALESCE(ch.name, '未分配') AS channel_name,
+               ucu.total_seconds, ucu.synced_seconds, ucu.last_synced_at
+        FROM user_channel_usage ucu
+        LEFT JOIN channels ch ON ch.id = ucu.channel_id
+        WHERE ucu.user_id = ?
+    """, (customer_id,)).fetchall()
+
+    # 当前用户的渠道ID和费率
+    settings = conn.execute(
+        "SELECT channel_id, rate_per_second FROM user_settings WHERE user_id=?", (customer_id,)
+    ).fetchone()
+    current_channel_id = settings["channel_id"] if settings else None
+    rate = settings["rate_per_second"] if settings else 2.30
+
+    # 余额
+    bal = conn.execute("SELECT balance FROM user_balance WHERE user_id=?", (customer_id,)).fetchone()
+    balance = bal["balance"] if bal else 0.0
+
+    conn.close()
+
+    return jsonify({
+        "code": 0,
+        "total_seconds": round(total_seconds, 2),
+        "balance": balance,
+        "rate_per_second": rate,
+        "remaining_seconds": round(balance / rate, 2) if rate > 0 else 0,
+        "current_channel_id": current_channel_id,
+        "channels": [dict(c) for c in channels_usage],
+    })
+
+
+@app.route("/api/sales/customer/<int:customer_id>", methods=["PUT"])
+@sales_required
+def api_sales_update_customer(customer_id):
+    """销售员编辑客户信息"""
+    uid = session["user_id"]
+    data = request.get_json(silent=True) or {}
+    changes = data.get("changes", {})  # {field: new_value}
+
+    if not changes:
+        return jsonify({"code": 400, "message": "没有修改内容"}), 400
+
+    conn = _get_db()
+
+    # 验证该客户属于当前销售员
+    sp = conn.execute("SELECT id FROM sales WHERE user_id=?", (uid,)).fetchone()
+    if not sp:
+        conn.close()
+        return jsonify({"code": 403, "message": "无权限"}), 403
+
+    rel = conn.execute(
+        "SELECT 1 FROM sales_customer WHERE sales_id=? AND user_id=?",
+        (sp["id"], customer_id)
+    ).fetchone()
+    if not rel:
+        conn.close()
+        return jsonify({"code": 403, "message": "该客户不属于您"}), 403
+
+    # 允许编辑的字段
+    allowed = {"email", "phone", "channel_id"}
+    applied = []
+
+    for field, new_val in changes.items():
+        if field not in allowed:
+            continue
+        if field == "email":
+            conn.execute("UPDATE users SET email=? WHERE id=?", (str(new_val).strip(), customer_id))
+        elif field == "phone":
+            conn.execute("UPDATE users SET phone=? WHERE id=?", (str(new_val).strip(), customer_id))
+        elif field == "channel_id":
+            conn.execute(
+                "UPDATE user_settings SET channel_id=?, updated_at=? WHERE user_id=?",
+                (int(new_val) if new_val else None, datetime.now().isoformat()[:19], customer_id)
+            )
+        applied.append(field)
+
+    conn.commit()
+    conn.close()
+
+    logger.info("销售员 %s 修改了客户 %s: %s", session["username"], customer_id, applied)
+    return jsonify({"code": 0, "message": f"已修改 {len(applied)} 项", "applied": applied})
+
+
+@app.route("/api/sales/customer/<int:customer_id>/models", methods=["GET"])
+@sales_required
+def api_sales_customer_models(customer_id):
+    """获取客户当前渠道下所有模型及启用状态"""
+    conn = _get_db()
+    # 获取客户的渠道
+    settings = conn.execute("SELECT channel_id FROM user_settings WHERE user_id=?", (customer_id,)).fetchone()
+    ch_id = settings["channel_id"] if settings else None
+    if not ch_id:
+        conn.close()
+        return jsonify({"code": 0, "models": []})
+
+    # 检查是否已有任何手动设置记录（首次初始化用）
+    has_any = conn.execute(
+        "SELECT 1 FROM customer_allowed_models WHERE user_id=? AND channel_id=?",
+        (customer_id, ch_id)
+    ).fetchone()
+
+    all_models = conn.execute("""
+        SELECT cmp.model_name, cmp.resolution, cmp.points_per_second, cmp.selling_price
+        FROM channel_model_pricing cmp
+        WHERE cmp.channel_id = ?
+        ORDER BY cmp.selling_price
+    """, (ch_id,)).fetchall()
+
+    result = []
+    for m in all_models:
+        mname = m["model_name"]
+        res = m["resolution"] or ""
+        sp = float(m["selling_price"] or m["points_per_second"] or 0)
+        # 组装 API 模型名：无分辨率直接用模型名，有分辨率用 模型名-分辨率
+        api_model_name = mname if not res else mname + '-' + res.lower()
+        existing = conn.execute(
+            "SELECT enabled FROM customer_allowed_models WHERE user_id=? AND model_name=? AND channel_id=?",
+            (customer_id, mname, ch_id)
+        ).fetchone()
+        if existing:
+            result.append({"model_name": api_model_name, "base_model": mname, "resolution": res, "selling_price": sp, "enabled": existing["enabled"]})
+        elif not has_any:
+            is_seedance = "seedance" in mname.lower()
+            enabled = 1 if is_seedance else 0
+            conn.execute(
+                "INSERT OR IGNORE INTO customer_allowed_models (user_id, model_name, channel_id, enabled) VALUES (?, ?, ?, ?)",
+                (customer_id, mname, ch_id, enabled)
+            )
+            result.append({"model_name": api_model_name, "base_model": mname, "resolution": res, "selling_price": sp, "enabled": enabled})
+        else:
+            result.append({"model_name": api_model_name, "base_model": mname, "resolution": res, "selling_price": sp, "enabled": 1})
+
+    conn.commit()
+    conn.close()
+    return jsonify({"code": 0, "models": result})
+
+
+@app.route("/api/sales/customer/<int:customer_id>/models/<model_name>/toggle", methods=["PUT"])
+@sales_required
+def api_sales_toggle_model(customer_id, model_name):
+    """销售员为客户开关某个模型"""
+    uid = session["user_id"]
+    conn = _get_db()
+    # 权限检查
+    sp = conn.execute("SELECT id FROM sales WHERE user_id=?", (uid,)).fetchone()
+    if not sp:
+        conn.close()
+        return jsonify({"code": 403, "message": "无权限"}), 403
+    rel = conn.execute(
+        "SELECT 1 FROM sales_customer WHERE sales_id=? AND user_id=?",
+        (sp["id"], customer_id)
+    ).fetchone()
+    if not rel:
+        conn.close()
+        return jsonify({"code": 403, "message": "该客户不属于您"}), 403
+
+    # 获取客户的渠道
+    settings = conn.execute("SELECT channel_id FROM user_settings WHERE user_id=?", (customer_id,)).fetchone()
+    ch_id = settings["channel_id"] if settings else None
+
+    # 查当前状态
+    existing = conn.execute(
+        "SELECT id, enabled FROM customer_allowed_models WHERE user_id=? AND model_name=?",
+        (customer_id, model_name)
+    ).fetchone()
+    if existing:
+        new_val = 0 if existing["enabled"] else 1
+        conn.execute("UPDATE customer_allowed_models SET enabled=? WHERE id=?", (new_val, existing["id"]))
+    else:
+        # 新建记录，默认禁用→启用
+        conn.execute(
+            "INSERT INTO customer_allowed_models (user_id, model_name, channel_id, enabled) VALUES (?, ?, ?, 0)",
+            (customer_id, model_name, ch_id or 1)
+        )
+        new_val = 0
+
+    conn.commit()
+    conn.close()
+    return jsonify({"code": 0, "enabled": bool(new_val), "message": f"模型 {model_name} 已{'启用' if new_val else '禁用'}"})
+
+
+@app.route("/api/sales/customer/<int:customer_id>/recharge", methods=["POST"])
+@sales_required
+def api_sales_recharge(customer_id):
+    """销售员为客户充值"""
+    uid = session["user_id"]
+    data = request.get_json(silent=True) or {}
+    amount = float(data.get("amount") or 0)
+    desc = (data.get("description") or "").strip()
+
+    if amount <= 0:
+        return jsonify({"code": 400, "message": "充值金额必须大于 0"}), 400
+
+    conn = _get_db()
+
+    # 验证客户属于当前销售员
+    sp = conn.execute("SELECT id FROM sales WHERE user_id=?", (uid,)).fetchone()
+    if not sp:
+        conn.close()
+        return jsonify({"code": 403, "message": "无权限"}), 403
+    rel = conn.execute(
+        "SELECT 1 FROM sales_customer WHERE sales_id=? AND user_id=?",
+        (sp["id"], customer_id)
+    ).fetchone()
+    if not rel:
+        conn.close()
+        return jsonify({"code": 403, "message": "该客户不属于您"}), 403
+
+    # 获取当前余额
+    bal = conn.execute(
+        "SELECT balance, total_deposit FROM user_balance WHERE user_id=?", (customer_id,)
+    ).fetchone()
+    if not bal:
+        conn.close()
+        return jsonify({"code": 404, "message": "客户余额记录不存在"}), 404
+
+    before = bal["balance"]
+    after  = before + amount
+    total  = bal["total_deposit"] + amount
+
+    conn.execute(
+        "UPDATE user_balance SET balance=?, total_deposit=? WHERE user_id=?",
+        (after, total, customer_id)
+    )
+    conn.execute(
+        "INSERT INTO recharge_records (user_id, amount, balance_before, balance_after, created_by, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (customer_id, amount, before, after, uid, desc, datetime.now().isoformat()[:19])
+    )
+
+    conn.commit()
+    conn.close()
+
+    logger.info("销售员 %s 为客户 %s 充值 ¥%s", session["username"], customer_id, amount)
+    return jsonify({
+        "code": 0,
+        "message": f"充值 ¥{amount:.2f} 成功",
+        "balance_before": before,
+        "balance_after": after,
+    })
+
+
+@app.route("/api/sales/customer/<int:customer_id>/recharges", methods=["GET"])
+@sales_required
+def api_sales_recharges(customer_id):
+    """获取客户的充值记录"""
+    conn = _get_db()
+    records = conn.execute("""
+        SELECT rr.id, rr.amount, rr.balance_before, rr.balance_after,
+               rr.description, rr.created_at, u.username AS created_by_name
+        FROM recharge_records rr
+        JOIN users u ON u.id = rr.created_by
+        WHERE rr.user_id = ?
+        ORDER BY rr.created_at DESC
+    """, (customer_id,)).fetchall()
+    conn.close()
+    return jsonify({"code": 0, "recharges": [dict(r) for r in records]})
+
+
+@app.route("/api/channels/all", methods=["GET"])
+def api_channels_all():
+    """获取所有渠道（供下拉框使用）"""
+    conn = _get_db()
+    channels = conn.execute("SELECT id, name, status FROM channels ORDER BY id").fetchall()
+    conn.close()
+    return jsonify({"code": 0, "channels": [dict(c) for c in channels]})
+
+
+@app.route("/api/channels/<int:ch_id>", methods=["PUT"])
+@admin_required
+def api_update_channel(ch_id):
+    """管理员更新渠道配置（API Key 等）"""
+    data = request.get_json(silent=True) or {}
+    conn = _get_db()
+    ch = conn.execute("SELECT * FROM channels WHERE id=?", (ch_id,)).fetchone()
+    if not ch:
+        conn.close()
+        return jsonify({"code": 404, "message": "渠道不存在"}), 404
+
+    new_api_key = data.get("api_key", ch["api_key"])
+    new_base_url = data.get("base_url", ch["base_url"])
+    new_status = data.get("status", ch["status"])
+
+    conn.execute(
+        "UPDATE channels SET api_key=?, base_url=?, status=? WHERE id=?",
+        (new_api_key, new_base_url, new_status, ch_id)
+    )
+    conn.commit()
+    conn.close()
+    logger.info("管理员更新渠道 %s", ch["name"])
+    return jsonify({"code": 0, "message": f"渠道 {ch['name']} 已更新"})
+
+
+@app.route("/api/pricing", methods=["GET"])
+def api_pricing():
+    """获取渠道-模型积分定价"""
+    zone_map = {"天翼云": "ZoneA", "百度云": "ZoneB"}
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT cmp.id, cmp.channel_id, ch.name AS channel_name,
+               cmp.model_name, cmp.resolution,
+               cmp.selling_price, cmp.points_per_second
+        FROM channel_model_pricing cmp
+        JOIN channels ch ON ch.id = cmp.channel_id
+        WHERE ch.status = 'active'
+        ORDER BY cmp.channel_id, cmp.model_name, cmp.resolution
+    """).fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["channel_name"] = zone_map.get(d["channel_name"], d["channel_name"])
+        result.append(d)
+    return jsonify({"code": 0, "pricing": result})
+
+
+@app.route("/api/pricing/<int:ch_id>/<model_name>", methods=["PUT"])
+@admin_required
+def api_update_pricing(ch_id, model_name):
+    """管理员更新模型定价，pps=0表示删除"""
+    data = request.get_json(silent=True) or {}
+    pps = int(data.get("points_per_second", 0))
+    conn = _get_db()
+    if pps == 0:
+        conn.execute("DELETE FROM channel_model_pricing WHERE channel_id=? AND model_name=?", (ch_id, model_name))
+        conn.commit()
+        conn.close()
+        return jsonify({"code": 0, "message": "模型已删除"})
+    conn.execute(
+        "UPDATE channel_model_pricing SET points_per_second=? WHERE channel_id=? AND model_name=?",
+        (pps, ch_id, model_name)
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO channel_model_pricing (channel_id, model_name, points_per_second) VALUES (?, ?, ?)",
+        (ch_id, model_name, pps)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"code": 0, "message": "定价已更新"})
+
+
+# ============================================================ #
+#               管理员定价管理 API（新增）                         #
+# ============================================================ #
+
+@app.route("/api/admin/pricing", methods=["GET"])
+@admin_required
+def api_admin_pricing():
+    """管理员获取定价列表（含成本价和利润率）"""
+    ch_id = request.args.get("channel_id", "")
+    conn = _get_db()
+    if ch_id:
+        rows = conn.execute("""
+            SELECT cmp.id, cmp.channel_id, ch.name AS channel_name,
+                   cmp.model_name, cmp.resolution,
+                   cmp.cost_price, cmp.selling_price, cmp.points_per_second
+            FROM channel_model_pricing cmp
+            JOIN channels ch ON ch.id = cmp.channel_id
+            WHERE cmp.channel_id = ?
+            ORDER BY cmp.model_name, cmp.resolution
+        """, (ch_id,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT cmp.id, cmp.channel_id, ch.name AS channel_name,
+                   cmp.model_name, cmp.resolution,
+                   cmp.cost_price, cmp.selling_price, cmp.points_per_second
+            FROM channel_model_pricing cmp
+            JOIN channels ch ON ch.id = cmp.channel_id
+            ORDER BY cmp.channel_id, cmp.model_name, cmp.resolution
+        """).fetchall()
+    conn.close()
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        cp = float(d.get("cost_price") or 0)
+        sp = float(d.get("selling_price") or 0)
+        if cp > 0 and sp > 0:
+            margin = round((sp - cp) / sp * 100, 1)
+            d["profit_margin"] = f"{margin}%"
+        else:
+            d["profit_margin"] = "N/A"
+        result.append(d)
+
+    return jsonify({"code": 0, "pricing": result})
+
+
+@app.route("/api/admin/pricing", methods=["POST"])
+@admin_required
+def api_admin_pricing_create():
+    """管理员新增模型定价"""
+    data = request.get_json(silent=True) or {}
+    ch_id = data.get("channel_id")
+    model_name = (data.get("model_name") or "").strip()
+    resolution = (data.get("resolution") or "").strip()
+    cost_price = data.get("cost_price")
+    selling_price = data.get("selling_price")
+
+    # --- 校验 ---
+    if not model_name:
+        return jsonify({"code": 400, "message": "模型名称不能为空"}), 400
+    if not ch_id:
+        return jsonify({"code": 400, "message": "请选择渠道"}), 400
+
+    try:
+        cost_price = float(cost_price) if cost_price is not None else 0
+        selling_price = float(selling_price) if selling_price is not None else 0
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "价格必须为数字"}), 400
+
+    if cost_price < 0:
+        return jsonify({"code": 400, "message": "成本价不能为负数"}), 400
+    if selling_price < 0:
+        return jsonify({"code": 400, "message": "销售价不能为负数"}), 400
+    if cost_price > 0 and selling_price > 0 and cost_price > selling_price:
+        return jsonify({"code": 400, "message": "成本价不能高于销售价"}), 400
+
+    conn = _get_db()
+
+    # 渠道校验
+    ch = conn.execute(
+        "SELECT id FROM channels WHERE id=? AND status='active'", (ch_id,)
+    ).fetchone()
+    if not ch:
+        conn.close()
+        return jsonify({"code": 400, "message": "渠道不存在或已停用"}), 400
+
+    # 同渠道同模型同分辨率查重
+    dup = conn.execute(
+        "SELECT id FROM channel_model_pricing WHERE channel_id=? AND model_name=? AND resolution=?",
+        (ch_id, model_name, resolution)
+    ).fetchone()
+    if dup:
+        conn.close()
+        return jsonify({"code": 400, "message": "该渠道下已存在同名同分辨率模型"}), 400
+
+    # 写入（selling_price 同步到 points_per_second）
+    pps = max(1, int(round(selling_price))) if selling_price > 0 else 0
+    conn.execute(
+        """INSERT INTO channel_model_pricing
+           (channel_id, model_name, resolution, cost_price, selling_price, points_per_second)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (ch_id, model_name, resolution, cost_price, selling_price, pps)
+    )
+    conn.commit()
+    new_id = _last_row_id(conn, "channel_model_pricing")
+    conn.close()
+
+    logger.info("管理员 %s 新增定价: channel=%s model=%s cost=%s selling=%s",
+                session["username"], ch_id, model_name, cost_price, selling_price)
+    return jsonify({"code": 0, "message": "定价已添加", "id": new_id})
+
+
+@app.route("/api/admin/pricing/<int:pid>", methods=["PUT"])
+@admin_required
+def api_admin_pricing_update(pid):
+    """管理员更新模型定价"""
+    data = request.get_json(silent=True) or {}
+    conn = _get_db()
+
+    current = conn.execute(
+        "SELECT * FROM channel_model_pricing WHERE id=?", (pid,)
+    ).fetchone()
+    if not current:
+        conn.close()
+        return jsonify({"code": 404, "message": "定价记录不存在"}), 404
+
+    # 读取传入值，未传则用当前值
+    new_cost = data.get("cost_price")
+    new_selling = data.get("selling_price")
+
+    cp = float(new_cost) if new_cost is not None else float(current["cost_price"] or 0)
+    sp = float(new_selling) if new_selling is not None else float(current["selling_price"] or 0)
+
+    # 交叉校验
+    if cp < 0:
+        conn.close()
+        return jsonify({"code": 400, "message": "成本价不能为负数"}), 400
+    if sp < 0:
+        conn.close()
+        return jsonify({"code": 400, "message": "销售价不能为负数"}), 400
+    if cp > 0 and sp > 0 and cp > sp:
+        conn.close()
+        return jsonify({"code": 400, "message": "成本价不能高于销售价"}), 400
+
+    # 更新（selling_price 同步到 points_per_second）
+    pps = max(1, int(round(sp))) if sp > 0 else 0
+    conn.execute(
+        """UPDATE channel_model_pricing
+           SET cost_price=?, selling_price=?, points_per_second=?
+           WHERE id=?""",
+        (cp, sp, pps, pid)
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info("管理员 %s 更新定价 id=%s cost=%s selling=%s",
+                session["username"], pid, cp, sp)
+    return jsonify({"code": 0, "message": "定价已更新"})
+
+
+@app.route("/api/admin/pricing/<int:pid>", methods=["DELETE"])
+@admin_required
+def api_admin_pricing_delete(pid):
+    """管理员删除模型定价"""
+    conn = _get_db()
+    current = conn.execute(
+        "SELECT model_name FROM channel_model_pricing WHERE id=?", (pid,)
+    ).fetchone()
+    if not current:
+        conn.close()
+        return jsonify({"code": 404, "message": "定价记录不存在"}), 404
+
+    conn.execute("DELETE FROM channel_model_pricing WHERE id=?", (pid,))
+    conn.commit()
+    conn.close()
+
+    logger.info("管理员 %s 删除定价 id=%s model=%s",
+                session["username"], pid, current["model_name"])
+    return jsonify({"code": 0, "message": "定价已删除"})
+
+
+@app.route("/api/showcase", methods=["GET"])
+def api_showcase():
+    """公开视频广场 — 无需登录，支持分类筛选"""
+    cat = request.args.get("category", "")
+    videos = [v for v in _video_store if v.get("url", "").startswith("/api/upload-file/")]
+    result = []
+    for v in videos:
+        item = {
+            "id": v.get("id", ""),
+            "name": v.get("name", "AI视频")[:30],
+            "url": v.get("url", ""),
+            "created_at": v.get("created_at", ""),
+            "owner_name": "用户" + str(v.get("owner_id", "")),
+            "category": v.get("category", "") or _detect_category(v.get("prompt_text", v.get("name", ""))),
+            "model_name": v.get("model_name", ""),
+            "duration": v.get("duration", 0),
+        }
+        if not cat or item["category"] == cat:
+            result.append(item)
+    result.reverse()
+    return jsonify({"code": 0, "videos": result[:20]})
+
+
+@app.route("/api/video-detail/<vid>", methods=["GET"])
+def api_video_detail(vid):
+    """视频详情 — 无需登录"""
+    for v in _video_store:
+        if v.get("id") == vid:
+            return jsonify({
+                "code": 0,
+                "video": {
+                    "id": v.get("id", ""),
+                    "name": v.get("name", ""),
+                    "url": v.get("url", ""),
+                    "created_at": v.get("created_at", ""),
+                    "prompt_text": v.get("prompt_text", ""),
+                    "model_name": v.get("model_name", ""),
+                    "duration": v.get("duration", 0),
+                    "category": v.get("category", "") or _detect_category(v.get("prompt_text", v.get("name", ""))),
+                    "owner_id": v.get("owner_id", 0),
+                }
+            })
+    return jsonify({"code": 404, "message": "视频不存在"}), 404
+
+
+@app.route("/api/config/exchange-rate", methods=["GET"])
+@admin_required
+def api_get_exchange():
+    """获取积分兑换配置"""
+    return jsonify({
+        "code": 0,
+        "points_per_yuan": int(os.environ.get("POINTS_PER_YUAN", "1")),
+        "description": "1元 = N积分"
+    })
+
+@app.route("/api/balance", methods=["GET"])
+@login_required
+def api_balance():
+    uid = session["user_id"]
+    conn = _get_db()
+    bal = conn.execute(
+        "SELECT balance, total_deposit, total_used, points FROM user_balance WHERE user_id=?", (uid,)
+    ).fetchone()
+    if not bal:
+        conn.execute(
+            "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)",
+            (uid,)
+        )
+        conn.commit()
+        bal = {"balance": 0, "total_deposit": 0, "total_used": 0, "points": 0}
+    else:
+        bal = dict(bal)
+    # 获取计费单价
+    set_row = conn.execute(
+        "SELECT rate_per_second, channel_id FROM user_settings WHERE user_id=?", (uid,)
+    ).fetchone()
+    channel_name = ""
+    ch_id = None
+    rate = 2.30
+    if set_row:
+        ch_id = set_row["channel_id"]
+        rate = set_row["rate_per_second"] or 2.30
+        if ch_id:
+            ch = conn.execute("SELECT name FROM channels WHERE id=?", (ch_id,)).fetchone()
+            if ch:
+                channel_name = ch["name"]
+
+    # 用量统计
+    total_row = conn.execute(
+        "SELECT COALESCE(SUM(total_seconds), 0) AS s FROM user_channel_usage WHERE user_id=?", (uid,)
+    ).fetchone()
+    total_seconds = round(total_row["s"], 2) if total_row else 0.0
+
+    # 当前渠道用量
+    cur_ch_seconds = 0.0
+    if ch_id:
+        ch_row = conn.execute(
+            "SELECT total_seconds FROM user_channel_usage WHERE user_id=? AND channel_id=?", (uid, ch_id)
+        ).fetchone()
+        cur_ch_seconds = round(ch_row["total_seconds"], 2) if ch_row else 0.0
+
+    # 子账号积分总消耗（主账号视角）
+    sub_points_used = 0
+    sub_rows = conn.execute(
+        "SELECT COALESCE(SUM(total_points_used), 0) AS s FROM user_balance ub JOIN users u ON u.id = ub.user_id WHERE u.owner_id = ?", (uid,)
+    ).fetchone()
+    sub_points_used = sub_rows["s"] if sub_rows else 0
+
+    conn.close()
+
+    remaining = round(bal["balance"] / rate, 2) if rate > 0 else 0.0
+
+    # Zone 映射
+    zone_map = {"天翼云": "ZoneA", "百度云": "ZoneB"}
+    zone_name = zone_map.get(channel_name, channel_name)
+
+    return jsonify({
+        "code": 0,
+        "balance": bal["balance"],
+        "total_deposit": bal["total_deposit"],
+        "total_used": bal["total_used"],
+        "points": bal["points"],
+        "sub_points_used": sub_points_used,
+        "rate_per_second": rate,
+        "channel_id": ch_id,
+        "channel_name": channel_name,
+        "zone": zone_name,
+        "total_seconds": total_seconds,
+        "channel_seconds": cur_ch_seconds,
+        "remaining_seconds": remaining,
+        "unit": "元",
+    })
+
+
+@app.route("/api/channels/active", methods=["GET"])
+def api_channels_active():
+    """获取当前激活的渠道列表（客户只能看，不能改）"""
+    conn = _get_db()
+    channels = conn.execute(
+        "SELECT id, name, status FROM channels WHERE status='active' ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return jsonify({"code": 0, "channels": [dict(c) for c in channels]})
+
+
+@app.route("/api/user-settings", methods=["GET"])
+@login_required
+def api_get_settings():
+    """获取当前用户的设置（选中的模型等）"""
+    uid = session["user_id"]
+    conn = _get_db()
+    s = conn.execute("SELECT selected_model FROM user_settings WHERE user_id=?", (uid,)).fetchone()
+    if not s:
+        conn.execute("INSERT INTO user_settings (user_id, selected_model, rate_per_second, updated_at) VALUES (?, '', 2.30, ?)",
+                     (uid, datetime.now().isoformat()[:19]))
+        conn.commit()
+        selected_model = ""
+    else:
+        selected_model = s["selected_model"] or ""
+    conn.close()
+    return jsonify({"code": 0, "selected_model": selected_model})
+
+
+@app.route("/api/user-settings/model", methods=["PUT"])
+@login_required
+def api_update_model():
+    """保存用户选择的模型"""
+    uid = session["user_id"]
+    data = request.get_json(silent=True) or {}
+    model = (data.get("model") or "").strip()
+    if not model:
+        return jsonify({"code": 400, "message": "请选择模型"}), 400
+
+    conn = _get_db()
+    exists = conn.execute("SELECT 1 FROM user_settings WHERE user_id=?", (uid,)).fetchone()
+    if exists:
+        conn.execute("UPDATE user_settings SET selected_model=?, updated_at=? WHERE user_id=?",
+                     (model, datetime.now().isoformat()[:19], uid))
+    else:
+        conn.execute("INSERT INTO user_settings (user_id, selected_model, rate_per_second, updated_at) VALUES (?, ?, 2.30, ?)",
+                     (uid, model, datetime.now().isoformat()[:19]))
+    conn.commit()
+    conn.close()
+    return jsonify({"code": 0, "message": "模型设置已保存", "model": model})
+
+
+# ============================================================ #
+#                        公开页面                                  #
+# ============================================================ #
+
+def _serve_html(filename, required=True):
+    """返回 HTML 文件，支持从 session 注入用户信息"""
+    path = os.path.join(FRONTEND_DIR, filename)
+    if not os.path.exists(path):
+        return jsonify({"code": 404, "message": f"页面 {filename} 不存在"}), 404
+    return send_from_directory(FRONTEND_DIR, filename)
+
+@app.route("/")
+def index():
+    return _serve_html("index.html")
+
+@app.route("/login")
+def login_page():
+    return _serve_html("login.html")
+
+@app.route("/register")
+def register_page():
+    return _serve_html("register.html")
+
+# 保护页面 — 通过 JS 检查登录状态
+@app.route("/dashboard")
+def dashboard_page():
+    return _serve_html("dashboard.html")
+
+@app.route("/admin")
+def admin_page():
+    return _serve_html("admin.html")
+
+@app.route("/detail")
+def detail_page():
+    return _serve_html("detail.html")
+
+@app.route("/showcase")
+def showcase_page():
+    return _serve_html("showcase.html")
+
+@app.route("/sales")
+def sales_page():
+    return _serve_html("sales.html")
+
+# ============================================================ #
+#                       认证 API                                  #
+# ============================================================ #
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    data = request.get_json(silent=True) or {}
+    username   = (data.get("username") or "").strip()
+    email      = (data.get("email") or "").strip()
+    phone      = (data.get("phone") or "").strip()
+    password   = (data.get("password") or "").strip()
+    sales_code = (data.get("sales_code") or "").strip().lower()
+
+    # 必填校验
+    if not username or not email or not phone or not password:
+        return jsonify({"code": 400, "message": "用户名、邮箱、手机号、密码为必填项"}), 400
+    if len(username) < 3:
+        return jsonify({"code": 400, "message": "用户名至少 3 个字符"}), 400
+    if len(password) < 6:
+        return jsonify({"code": 400, "message": "密码至少 6 个字符"}), 400
+
+    # 手机号校验：中国大陆 11 位，1 开头
+    phone_pat = r'^1[3-9]\d{9}$'
+    if not re.match(phone_pat, phone):
+        return jsonify({"code": 400, "message": "手机号格式不正确（11位中国大陆手机号）"}), 400
+
+    # 邮箱格式校验
+    email_pat = r'^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    if not re.match(email_pat, email):
+        return jsonify({"code": 400, "message": "邮箱格式不正确"}), 400
+
+    conn = _get_db()
+
+    # 查重
+    existing = conn.execute(
+        "SELECT id FROM users WHERE username=? OR email=? OR phone=?",
+        (username, email, phone)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"code": 400, "message": "用户名、邮箱或手机号已被注册"}), 400
+
+    # 销售员码匹配
+    sales_id = None
+    matched_sales_name = ""
+    if sales_code:
+        sp = conn.execute(
+            "SELECT id, name FROM sales WHERE code=?", (sales_code,)
+        ).fetchone()
+        if sp:
+            sales_id = sp["id"]
+            matched_sales_name = sp["name"]
+        else:
+            conn.close()
+            return jsonify({"code": 400, "message": f"销售员码 '{sales_code}' 不存在"}), 400
+
+    # 写入用户（status=pending 待审核）
+    conn.execute(
+        "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (username, email, phone, generate_password_hash(password), "user", "pending",
+         datetime.now().isoformat()[:19])
+    )
+    new_id = _last_row_id(conn, "users")
+
+    # 关联销售员
+    if sales_id:
+        conn.execute(
+            "INSERT INTO sales_customer (sales_id, user_id, created_at) VALUES (?, ?, ?)",
+            (sales_id, new_id, datetime.now().isoformat()[:19])
+        )
+
+    conn.execute("INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)", (new_id,))
+    conn.execute("INSERT INTO user_settings (user_id, selected_model, rate_per_second, updated_at) VALUES (?, '', 2.30, ?)",
+                 (new_id, datetime.now().isoformat()[:19]))
+    conn.commit()
+    conn.close()
+
+    logger.info("新用户注册: %s (%s) phone=%s status=pending", username, email, phone)
+
+    msg = "注册已成功，等待销售员进行审核通过"
+    if sales_code and matched_sales_name:
+        msg += f"（销售员：{matched_sales_name}）"
+
+    return jsonify({"code": 0, "message": msg})
+
+
+# -------- 积分使用明细 --------
+
+@app.route("/api/points-usage", methods=["GET"])
+@login_required
+def api_points_usage():
+    """获取积分使用记录（支持子账号筛选）"""
+    uid = session["user_id"]
+    sub_id = request.args.get("user_id", "").strip()
+    target_id = int(sub_id) if sub_id else uid
+
+    conn = _get_db()
+    # 权限检查：只能查自己或自己的子账号
+    if target_id != uid:
+        sub = conn.execute("SELECT id FROM users WHERE id=? AND owner_id=?", (target_id, uid)).fetchone()
+        if not sub:
+            conn.close()
+            return jsonify({"code": 403, "message": "无权查看"}), 403
+
+    records = conn.execute("""
+        SELECT pur.id, pur.points_used, pur.balance_after, pur.model_name,
+               pur.duration, pur.created_at
+        FROM points_usage_records pur
+        WHERE pur.user_id = ?
+        ORDER BY pur.created_at DESC
+        LIMIT 50
+    """, (target_id,)).fetchall()
+    total = conn.execute(
+        "SELECT COALESCE(SUM(points_used), 0) AS total FROM points_usage_records WHERE user_id=?", (target_id,)
+    ).fetchone()
+
+    conn.close()
+    return jsonify({"code": 0, "total_points_used": total["total"] if total else 0, "records": [dict(r) for r in records]})
+
+
+@app.route("/api/sub-accounts", methods=["GET"])
+@login_required
+def api_sub_accounts():
+    """获取当前用户创建的所有子账号"""
+    uid = session["user_id"]
+    conn = _get_db()
+    subs = conn.execute("""
+        SELECT u.id, u.username, u.email, u.phone, u.status, u.created_at,
+               ub.points, ub.balance, ub.total_points_used
+        FROM users u
+        LEFT JOIN user_balance ub ON ub.user_id = u.id
+        WHERE u.owner_id = ?
+        ORDER BY u.created_at DESC
+    """, (uid,)).fetchall()
+    conn.close()
+    return jsonify({"code": 0, "sub_accounts": [dict(s) for s in subs]})
+
+
+@app.route("/api/sub-accounts", methods=["POST"])
+@login_required
+def api_create_sub_account():
+    """主账号创建子账号（自动审核通过）"""
+    uid = session["user_id"]
+    # 子账户不能创建子账号
+    conn = _get_db()
+    me = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+    if me and me["role"] == "user":
+        conn.close()
+        return jsonify({"code": 403, "message": "子账户不能创建子账号"}), 403
+    conn.close()
+
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    email    = (data.get("email") or "").strip()
+    phone    = (data.get("phone") or "").strip()
+    password = (data.get("password") or "").strip()
+
+    if not username or not email or not phone or not password:
+        return jsonify({"code": 400, "message": "用户名、邮箱、手机号、密码为必填项"}), 400
+    if len(username) < 3:
+        return jsonify({"code": 400, "message": "用户名至少 3 个字符"}), 400
+    if len(password) < 6:
+        return jsonify({"code": 400, "message": "密码至少 6 个字符"}), 400
+    if not re.match(r'^1[3-9]\d{9}$', phone):
+        return jsonify({"code": 400, "message": "手机号格式不正确"}), 400
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        return jsonify({"code": 400, "message": "邮箱格式不正确"}), 400
+
+    conn = _get_db()
+    existing = conn.execute(
+        "SELECT id FROM users WHERE username=? OR email=? OR phone=?", (username, email, phone)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"code": 400, "message": "用户名、邮箱或手机号已被注册"}), 400
+
+    # 继承主账号的销售员关联
+    main_sp = conn.execute(
+        "SELECT sales_id FROM sales_customer WHERE user_id=?", (uid,)
+    ).fetchone()
+    # 继承主账号的设置
+    main_settings = conn.execute(
+        "SELECT selected_model, rate_per_second, channel_id FROM user_settings WHERE user_id=?", (uid,)
+    ).fetchone()
+
+    conn.execute(
+        "INSERT INTO users (username, email, phone, password, role, status, owner_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (username, email, phone, generate_password_hash(password), "account", "approved", uid,
+         datetime.now().isoformat()[:19])
+    )
+    new_id = _last_row_id(conn, "users")
+
+    if main_sp:
+        conn.execute(
+            "INSERT INTO sales_customer (sales_id, user_id, created_at) VALUES (?, ?, ?)",
+            (main_sp["sales_id"], new_id, datetime.now().isoformat()[:19])
+        )
+    conn.execute("INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)", (new_id,))
+    if main_settings:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, selected_model, rate_per_second, channel_id, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (new_id, main_settings["selected_model"] or "", main_settings["rate_per_second"] or 2.30,
+             main_settings["channel_id"], datetime.now().isoformat()[:19])
+        )
+    else:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, selected_model, rate_per_second, updated_at) VALUES (?, '', 2.30, ?)",
+            (new_id, datetime.now().isoformat()[:19])
+        )
+
+    conn.commit()
+    conn.close()
+
+    logger.info("子账号创建: %s (主账号=%s)", username, session["username"])
+    return jsonify({"code": 0, "message": "子账号创建成功，已自动审核通过，可直接登录"})
+
+
+@app.route("/api/sub-accounts/<int:sub_id>", methods=["DELETE"])
+@login_required
+def api_delete_sub_account(sub_id):
+    """删除子账号（只能删自己的）"""
+    uid = session["user_id"]
+    conn = _get_db()
+    sub = conn.execute("SELECT id FROM users WHERE id=? AND owner_id=?", (sub_id, uid)).fetchone()
+    if not sub:
+        conn.close()
+        return jsonify({"code": 404, "message": "子账号不存在或不属于您"}), 404
+    conn.execute("DELETE FROM user_balance WHERE user_id=?", (sub_id,))
+    conn.execute("DELETE FROM user_settings WHERE user_id=?", (sub_id,))
+    conn.execute("DELETE FROM sales_customer WHERE user_id=?", (sub_id,))
+    conn.execute("DELETE FROM user_channel_usage WHERE user_id=?", (sub_id,))
+    conn.execute("DELETE FROM users WHERE id=?", (sub_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"code": 0, "message": "子账号已删除"})
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"code": 400, "message": "请输入用户名和密码"}), 400
+
+    conn = _get_db()
+    user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    conn.close()
+
+    if not user or not check_password_hash(user["password"], password):
+        return jsonify({"code": 401, "message": "用户名或密码错误"}), 401
+
+    if user["status"] == "pending":
+        return jsonify({"code": 403, "message": "您的账号正在等待销售员审核，审核通过后方可登录"}), 403
+
+    session["user_id"]  = user["id"]
+    session["username"] = user["username"]
+    session["role"]     = user["role"]
+
+    logger.info("用户登录: %s (role=%s)", username, user["role"])
+    return jsonify({
+        "code": 0,
+        "message": "登录成功",
+        "user": {"id": user["id"], "username": user["username"], "email": user["email"], "role": user["role"]},
+    })
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return jsonify({"code": 0, "message": "已退出登录"})
+
+
+@app.route("/api/me", methods=["GET"])
+def api_me():
+    if not session.get("user_id"):
+        return jsonify({"code": 401, "logged_in": False}), 401
+    uid = session["user_id"]
+    conn = _get_db()
+    user = conn.execute("SELECT owner_id FROM users WHERE id=?", (uid,)).fetchone()
+    conn.close()
+    return jsonify({
+        "code": 0,
+        "logged_in": True,
+        "user": {
+            "id":       uid,
+            "username": session["username"],
+            "role":     session["role"],
+            "owner_id": user["owner_id"] if user else None,
+        }
+    })
+
+
+# ============================================================ #
+#                      管理员 API                                 #
+# ============================================================ #
+
+@app.route("/api/sales/list", methods=["GET"])
+@admin_required
+def api_sales_list():
+    """获取所有销售员列表"""
+    conn = _get_db()
+    sps = conn.execute("""
+        SELECT s.id, s.name, s.code, s.phone, u.id AS user_id, u.username
+        FROM sales s
+        JOIN users u ON u.id = s.user_id
+        ORDER BY s.id
+    """).fetchall()
+    conn.close()
+    return jsonify({"code": 0, "sales": [dict(s) for s in sps]})
+
+
+@app.route("/api/users/<int:uid>/assign-sales", methods=["PUT"])
+@admin_required
+def api_assign_sales(uid):
+    """将用户关联到销售员"""
+    data = request.get_json(silent=True) or {}
+    sp_id = data.get("sales_id")
+    conn = _get_db()
+    if sp_id:
+        conn.execute(
+            "INSERT OR REPLACE INTO sales_customer (sales_id, user_id, created_at) VALUES (?, ?, ?)",
+            (sp_id, uid, datetime.now().isoformat()[:19])
+        )
+    else:
+        conn.execute("DELETE FROM sales_customer WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"code": 0, "message": "关联已更新"})
+
+
+@app.route("/api/users", methods=["GET"])
+@admin_required
+def api_users():
+    sp_filter = request.args.get("sales_id", "")
+    conn = _get_db()
+    if sp_filter:
+        users = conn.execute("""
+            SELECT u.id, u.username, u.email, u.phone, u.role, u.status, u.owner_id, u.created_at,
+                   COALESCE(sp.name, '') AS sales_name, sp.id AS sales_id
+            FROM users u
+            JOIN sales_customer sc ON sc.user_id = u.id
+            JOIN sales sp ON sp.id = sc.sales_id
+            WHERE sc.sales_id = ?
+            ORDER BY u.id
+        """, (sp_filter,)).fetchall()
+    else:
+        users = conn.execute("""
+            SELECT u.id, u.username, u.email, u.phone, u.role, u.status, u.owner_id, u.created_at,
+                   COALESCE(sp.name, '') AS sales_name, sp.id AS sales_id
+            FROM users u
+            LEFT JOIN sales_customer sc ON sc.user_id = u.id
+            LEFT JOIN sales sp ON sp.id = sc.sales_id
+            ORDER BY u.id
+        """).fetchall()
+    conn.close()
+    return jsonify({"code": 0, "users": [dict(u) for u in users]})
+
+
+@app.route("/api/users/<int:uid>", methods=["DELETE"])
+@admin_required
+def api_delete_user(uid):
+    if uid == session["user_id"]:
+        return jsonify({"code": 400, "message": "不能删除自己"}), 400
+    conn = _get_db()
+    conn.execute("DELETE FROM users WHERE id=?", (uid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"code": 0, "message": "用户已删除"})
+
+
+@app.route("/api/users", methods=["POST"])
+@admin_required
+def api_create_user():
+    """管理员创建用户（可指定角色：admin / sales / user）"""
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    email    = (data.get("email") or "").strip()
+    phone    = (data.get("phone") or "").strip()
+    password = (data.get("password") or "").strip()
+    role     = (data.get("role") or "account").strip()
+
+    if not username or not email or not phone or not password:
+        return jsonify({"code": 400, "message": "用户名、邮箱、手机号、密码为必填项"}), 400
+    if len(username) < 3:
+        return jsonify({"code": 400, "message": "用户名至少 3 个字符"}), 400
+    if len(password) < 6:
+        return jsonify({"code": 400, "message": "密码至少 6 个字符"}), 400
+    if role not in ("admin", "sales", "account", "user"):
+        return jsonify({"code": 400, "message": "角色必须为 admin、sales 或 user"}), 400
+    if not re.match(r'^1[3-9]\d{9}$', phone):
+        return jsonify({"code": 400, "message": "手机号格式不正确"}), 400
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        return jsonify({"code": 400, "message": "邮箱格式不正确"}), 400
+
+    conn = _get_db()
+    existing = conn.execute(
+        "SELECT id FROM users WHERE username=? OR email=? OR phone=?",
+        (username, email, phone)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"code": 400, "message": "用户名、邮箱或手机号已被注册"}), 400
+
+    conn.execute(
+        "INSERT INTO users (username, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (username, email, phone, generate_password_hash(password), role, "approved",
+         datetime.now().isoformat()[:19])
+    )
+    new_id = _last_row_id(conn, "users")
+    conn.execute("INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)", (new_id,))
+    conn.execute("INSERT INTO user_settings (user_id, selected_model, rate_per_second, updated_at) VALUES (?, '', 2.30, ?)",
+                 (new_id, datetime.now().isoformat()[:19]))
+    conn.commit()
+    conn.close()
+
+    logger.info("管理员创建用户: %s role=%s", username, role)
+    return jsonify({"code": 0, "message": f"用户 {username} 创建成功", "user_id": new_id})
+
+
+@app.route("/api/users/<int:uid>", methods=["GET"])
+@admin_required
+def api_get_user(uid):
+    """获取单个用户详情"""
+    conn = _get_db()
+    u = conn.execute(
+        """SELECT u.id, u.username, u.email, u.phone, u.role, u.status, u.created_at,
+                  sc.sales_id, COALESCE(sp.name, '') AS sales_name
+           FROM users u
+           LEFT JOIN sales_customer sc ON sc.user_id = u.id
+           LEFT JOIN sales sp ON sp.id = sc.sales_id
+           WHERE u.id=?""", (uid,)
+    ).fetchone()
+    if not u:
+        conn.close()
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    bal = conn.execute("SELECT * FROM user_balance WHERE user_id=?", (uid,)).fetchone()
+    sets = conn.execute("SELECT * FROM user_settings WHERE user_id=?", (uid,)).fetchone()
+    # 子账号
+    subs = conn.execute("SELECT id, username, email, phone, status, created_at FROM users WHERE owner_id=?", (uid,)).fetchall()
+    # 积分使用记录
+    usage = conn.execute(
+        "SELECT * FROM points_usage_records WHERE user_id=? ORDER BY created_at DESC LIMIT 50", (uid,)
+    ).fetchall()
+    conn.close()
+
+    return jsonify({
+        "code": 0,
+        "user": dict(u),
+        "balance": dict(bal) if bal else None,
+        "settings": dict(sets) if sets else None,
+        "sub_accounts": [dict(s) for s in subs],
+        "points_usage": [dict(r) for r in usage],
+    })
+
+
+@app.route("/api/users/<int:uid>", methods=["PUT"])
+@admin_required
+def api_update_user(uid):
+    """管理员更新用户信息（角色、状态、邮箱、手机号、积分、余额等）"""
+    data = request.get_json(silent=True) or {}
+    conn = _get_db()
+    u = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        conn.close()
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    changes = []
+
+    # --- 用户表字段 ---
+    new_email = data.get("email", u["email"]).strip() if data.get("email") is not None else u["email"]
+    new_phone = data.get("phone", u["phone"]).strip() if data.get("phone") is not None else u["phone"]
+
+    new_role = data.get("role", u["role"]).strip() if data.get("role") is not None else u["role"]
+    new_status = data.get("status", u["status"]).strip() if data.get("status") is not None else u["status"]
+
+    # 不能改自己的角色
+    if uid == session["user_id"]:
+        new_role = u["role"]
+
+    if new_role not in ("admin", "sales", "account", "user"):
+        new_role = u["role"]
+    if new_status not in ("pending", "approved", "disabled"):
+        new_status = u["status"]
+
+    # 邮箱/手机号查重（排除自己）
+    if new_email != u["email"]:
+        dup = conn.execute("SELECT id FROM users WHERE email=? AND id!=?", (new_email, uid)).fetchone()
+        if dup:
+            conn.close()
+            return jsonify({"code": 400, "message": "该邮箱已被其他用户使用"}), 400
+    if new_phone != u["phone"]:
+        dup = conn.execute("SELECT id FROM users WHERE phone=? AND id!=?", (new_phone, uid)).fetchone()
+        if dup:
+            conn.close()
+            return jsonify({"code": 400, "message": "该手机号已被其他用户使用"}), 400
+
+    conn.execute(
+        "UPDATE users SET email=?, phone=?, role=?, status=? WHERE id=?",
+        (new_email, new_phone, new_role, new_status, uid)
+    )
+    changes.append(f"email={new_email} phone={new_phone} role={new_role} status={new_status}")
+
+    # --- 余额表字段 ---
+    if "points" in data or "balance" in data:
+        bal = conn.execute("SELECT * FROM user_balance WHERE user_id=?", (uid,)).fetchone()
+        if bal:
+            new_points = int(data.get("points", bal["points"])) if data.get("points") is not None else bal["points"]
+            new_balance = float(data.get("balance", bal["balance"])) if data.get("balance") is not None else bal["balance"]
+            new_total_deposit = float(data.get("total_deposit", bal["total_deposit"])) if data.get("total_deposit") is not None else bal["total_deposit"]
+            conn.execute(
+                "UPDATE user_balance SET points=?, balance=?, total_deposit=? WHERE user_id=?",
+                (new_points, new_balance, new_total_deposit, uid)
+            )
+            changes.append(f"points={new_points} balance={new_balance}")
+        else:
+            new_points = int(data.get("points", 0))
+            new_balance = float(data.get("balance", 0))
+            conn.execute(
+                "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, ?, 0, 0, ?)",
+                (uid, new_balance, new_points)
+            )
+            changes.append(f"points={new_points} balance={new_balance} (新建)")
+
+    # 如果余额/积分有变化，记录充值
+    if "balance" in data or "points" in data:
+        old_bal = conn.execute("SELECT balance, points FROM user_balance WHERE user_id=?", (uid,)).fetchone()
+        if old_bal:
+            new_bal = float(data.get("balance", old_bal["balance"])) if "balance" in data else old_bal["balance"]
+            amount_diff = new_bal - old_bal["balance"]
+            if amount_diff != 0:
+                conn.execute(
+                    "INSERT INTO recharge_records (user_id, amount, balance_before, balance_after, created_by, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (uid, amount_diff, old_bal["balance"], new_bal,
+                     session["user_id"], "管理员手动调整", datetime.now().isoformat()[:19])
+                )
+
+    conn.commit()
+    conn.close()
+    logger.info("管理员更新用户 %s: %s", u["username"], ", ".join(changes))
+    return jsonify({"code": 0, "message": "用户信息已更新"})
+
+
+# ============================================================
+# 天翼云用量查询（CTAPI 签名代理）
+# ============================================================
+CTYUN_AK = os.environ.get("CTYUN_AK", "d14eefa3e0324d17aa157b8f81b7b31e")
+CTYUN_SK = os.environ.get("CTYUN_SK", "2ef0730bf6da424393e2ec88876fcd02")
+CTYUN_MGMT_HOST = "aigw-global.ctapi.ctyun.cn"
+
+def _ctyun_mgmt_request(method, path, body_dict=None, query_params=None):
+    """调用天翼云管理API (CTAPI签名)"""
+    import uuid as _uuid
+    eop_date = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    request_id = str(_uuid.uuid1())
+    query_str = ""
+    if query_params:
+        sorted_params = sorted(query_params.items(), key=lambda x: x[0])
+        query_str = "&".join("%s=%s" % (k, v) for k, v in sorted_params)
+    body_str = json.dumps(body_dict) if body_dict else ""
+    body_hash = hashlib.sha256(body_str.encode()).hexdigest()
+    header_str = "ctyun-eop-request-id:%s\neop-date:%s\n" % (request_id, eop_date)
+    sign_str = "%s\n%s\n%s" % (header_str, query_str, body_hash)
+    ktime = hmac.new(bytearray(CTYUN_SK.encode()), bytearray(eop_date.encode()), hashlib.sha256).digest()
+    kAk = hmac.new(bytearray(ktime), bytearray(CTYUN_AK.encode()), hashlib.sha256).digest()
+    kdate = hmac.new(bytearray(kAk), bytearray(eop_date[:8].encode()), hashlib.sha256).digest()
+    sig_raw = hmac.new(bytearray(kdate), bytearray(sign_str.encode()), hashlib.sha256).digest()
+    signature = base64.b64encode(sig_raw).decode()
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "eop-date": eop_date,
+        "ctyun-eop-request-id": request_id,
+        "Eop-Authorization": "%s Headers=ctyun-eop-request-id;eop-date Signature=%s" % (CTYUN_AK, signature)
+    }
+    full_url = "https://%s%s" % (CTYUN_MGMT_HOST, path)
+    if query_params:
+        full_url += "?" + query_str
+    if method == "GET":
+        resp = requests.get(full_url, headers=headers, timeout=15)
+    else:
+        resp = requests.post(full_url, data=body_str.encode(), headers=headers, timeout=15)
+    return resp.json() if resp.status_code == 200 else {"error": resp.text, "status": resp.status_code}
+
+
+@app.route("/api/admin/ctyun-usage", methods=["GET"])
+@admin_required
+def api_ctyun_usage():
+    """获取天翼云用量数据，支持自定义时间范围"""
+    start = request.args.get("start", "")
+    end = request.args.get("end", "")
+    if not start or not end:
+        days = int(request.args.get("days", 30))
+        start = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
+        end = datetime.utcnow().strftime("%Y-%m-%d 23:59:59")
+    try:
+        data = _ctyun_mgmt_request("POST", "/v1/tokenUsage/query",
+            {"groupBy": 1, "startTime": start, "endTime": end})
+        # 拆解数据：提取调用次数、Token、时长
+        usage_data = data.get("returnObj", [])
+        summary = {"total_requests": 0, "total_tokens": 0, "total_in_tokens": 0, "total_out_tokens": 0, "total_duration_sec": 0}
+        models_detail = {}
+        for obj in usage_data:
+            summary["total_requests"] += obj.get("request", 0)
+            summary["total_tokens"] += obj.get("tokens", 0)
+            summary["total_in_tokens"] += obj.get("inputTokens", 0)
+            summary["total_out_tokens"] += obj.get("outputTokens", 0)
+            summary["total_duration_sec"] += obj.get("totalDuration", 0)
+            for det in obj.get("detail", []):
+                name = det.get("name", "未知")
+                if name not in models_detail:
+                    models_detail[name] = {"requests": 0, "in_tokens": 0, "out_tokens": 0, "duration_sec": 0, "stages": []}
+                models_detail[name]["requests"] += det.get("amountRequest", 0)
+                for s in det.get("stage", []):
+                    models_detail[name]["in_tokens"] += s.get("inputTokens", 0)
+                    models_detail[name]["out_tokens"] += s.get("outputTokens", 0)
+                    models_detail[name]["stages"].append({
+                        "in": s.get("inputTokens", 0), "out": s.get("outputTokens", 0),
+                        "count": s.get("requestCount", 0),
+                        "min_ctx": s.get("minContext", 0), "max_ctx": s.get("maxContext", 0)
+                    })
+                for r in (det.get("resolutionDuration") or []):
+                    models_detail[name]["duration_sec"] += r.get("cnt", 0)
+        return jsonify({"code": 0, "summary": summary, "models": models_detail, "start": start, "end": end})
+    except Exception as e:
+        return jsonify({"code": 500, "message": str(e)}), 500
+
+
+@app.route("/api/admin/ctyun-models", methods=["GET"])
+@admin_required
+def api_ctyun_models():
+    """获取天翼云已开通模型"""
+    try:
+        data = _ctyun_mgmt_request("GET", "/v1/model/list")
+        return jsonify({"code": 0, "models": data.get("returnObj", [])})
+    except Exception as e:
+        return jsonify({"code": 500, "message": str(e)}), 500
+
+
+@app.route("/api/admin/videos", methods=["GET"])
+@admin_required
+def api_admin_videos():
+    """管理员查看所有视频"""
+    return jsonify({"code": 0, "videos": list(_video_store)})
+
+
+@app.route("/api/admin/tasks", methods=["GET"])
+@admin_required
+def api_admin_tasks():
+    """管理员查看所有任务（从数据库读取，重启不丢）"""
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT id, remote_task_id, model, prompt_text, status, video_url,
+               channel_name, username, created_at
+        FROM tasks ORDER BY created_at DESC LIMIT 100
+    """).fetchall()
+    conn.close()
+    tasks = []
+    for r in rows:
+        tasks.append({
+            "task_id": r["id"][:16] + "..." if len(r["id"]) > 16 else r["id"],
+            "remote_task_id": r["remote_task_id"] or "",
+            "model": r["model"] or "",
+            "prompt": (r["prompt_text"] or "")[:80],
+            "status": r["status"] or "",
+            "video_url": r["video_url"] or "",
+            "channel": r["channel_name"] or "",
+            "username": r["username"] or "",
+            "created_at": r["created_at"] or "",
+        })
+    return jsonify({"code": 0, "tasks": tasks})
+
+
+@app.route("/api/admin/recharge", methods=["POST"])
+@admin_required
+def api_admin_recharge():
+    """管理员为客户充值"""
+    data = request.get_json(silent=True) or {}
+    user_id = int(data.get("user_id") or 0)
+    amount = float(data.get("amount") or 0)
+    desc = (data.get("description") or "").strip()
+    if not user_id or amount <= 0:
+        return jsonify({"code": 400, "message": "参数错误"}), 400
+
+    conn = _get_db()
+    user = conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    bal = conn.execute("SELECT balance, total_deposit, points FROM user_balance WHERE user_id=?", (user_id,)).fetchone()
+    if not bal:
+        conn.execute("INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?,0,0,0,0)", (user_id,))
+        before_bal = 0; before_pts = 0; before_dep = 0
+    else:
+        before_bal = bal["balance"]; before_pts = bal["points"]; before_dep = bal["total_deposit"]
+
+    after_bal = before_bal + amount
+    after_pts = before_pts + int(amount)
+    after_dep = before_dep + amount
+
+    conn.execute("UPDATE user_balance SET balance=?, total_deposit=?, points=? WHERE user_id=?",
+                 (after_bal, after_dep, after_pts, user_id))
+    conn.execute("INSERT INTO recharge_records (user_id, amount, balance_before, balance_after, created_by, description, created_at) VALUES (?,?,?,?,?,?,?)",
+                 (user_id, amount, before_bal, after_bal, session["user_id"], desc, datetime.now().isoformat()[:19]))
+    conn.commit()
+    conn.close()
+
+    logger.info("管理员 %s 为用户 %s 充值 ¥%s", session["username"], user["username"], amount)
+    return jsonify({"code": 0, "message": f"已为用户 {user['username']} 充值 ¥{amount:.2f}",
+                    "balance_before": before_bal, "balance_after": after_bal,
+                    "points_before": before_pts, "points_after": after_pts})
+
+
+@app.route("/api/admin/recharges/<int:user_id>", methods=["GET"])
+@admin_required
+def api_admin_recharges(user_id):
+    """管理员查看某用户的充值记录"""
+    conn = _get_db()
+    records = conn.execute("""
+        SELECT rr.id, rr.amount, rr.balance_before, rr.balance_after,
+               rr.description, rr.created_at, u.username AS created_by_name
+        FROM recharge_records rr JOIN users u ON u.id = rr.created_by
+        WHERE rr.user_id=? ORDER BY rr.created_at DESC LIMIT 50
+    """, (user_id,)).fetchall()
+    conn.close()
+    return jsonify({"code": 0, "recharges": [dict(r) for r in records]})
+
+
+@app.route("/api/admin/logs", methods=["GET"])
+@admin_required
+def api_admin_logs():
+    """管理员查看请求日志"""
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT id, username, action, frontend_request, backend_request, backend_response,
+               response, status_code, duration_ms, created_at
+        FROM request_logs ORDER BY id DESC LIMIT 200
+    """).fetchall()
+    conn.close()
+    logs = []
+    for r in rows:
+        logs.append({
+            "id": r["id"],
+            "username": r["username"] or "",
+            "action": r["action"],
+            "frontend_request": r["frontend_request"] or "",
+            "backend_request": r["backend_request"] or "",
+            "backend_response": r["backend_response"] or "",
+            "request": r["response"] or "",
+            "response": r["response"] or "",
+            "status_code": r["status_code"],
+            "duration_ms": r["duration_ms"],
+            "created_at": r["created_at"],
+        })
+    return jsonify({"code": 0, "logs": logs})
+
+
+@app.route("/api/site-stats", methods=["GET"])
+@admin_required
+def api_site_stats():
+    conn = _get_db()
+    total = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
+    admin_count = conn.execute("SELECT COUNT(*) AS cnt FROM users WHERE role='admin'").fetchone()["cnt"]
+    # 财务汇总
+    fin = conn.execute("SELECT COALESCE(SUM(total_deposit),0) as td, COALESCE(SUM(total_used),0) as tu, COALESCE(SUM(points),0) as tp FROM user_balance").fetchone()
+    conn.close()
+    return jsonify({
+        "code": 0,
+        "stats": {
+            "total_users": total,
+            "admin_users": admin_count,
+            "videos_stored": len(_video_store),
+            "tasks_processed": len(_task_store),
+            "total_deposit": round(fin["td"], 2),
+            "total_used": round(fin["tu"], 2),
+            "total_points": int(fin["tp"]),
+        }
+    })
+
+
+# ============================================================ #
+#                       AI 网关 API                               #
+# ============================================================ #
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"ok": True, "time": datetime.now().isoformat(),
+                    "db": "postgresql" if USE_PG else "sqlite",
+                    "frontend": FRONTEND_DIR,
+                    "files": os.listdir(FRONTEND_DIR)[:10] if os.path.isdir(FRONTEND_DIR) else [],
+                    "ctyun_key_set": bool(os.environ.get("CTYUN_API_KEY")),
+                    "gogo_key_set": bool(os.environ.get("GOGO_API_KEY"))})
+
+
+@app.route("/api/models", methods=["GET"])
+def list_models():
+    """返回当前用户可用的模型列表（主数据源: channel_model_pricing）"""
+    conn = _get_db()
+    uid = session.get("user_id")
+    user_ch_id = None
+    disabled_set = set()
+
+    if uid:
+        us = conn.execute("SELECT channel_id FROM user_settings WHERE user_id=?", (uid,)).fetchone()
+        if us and us["channel_id"]:
+            user_ch_id = us["channel_id"]
+        role = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+        is_regular = role and role["role"] == "account"
+        if is_regular:
+            rows = conn.execute(
+                "SELECT model_name FROM customer_allowed_models WHERE user_id=? AND channel_id=? AND enabled=0",
+                (uid, user_ch_id or 0)
+            ).fetchall()
+            disabled_set = set(r["model_name"] for r in rows)
+
+    # 从定价表加载：展示所有活跃渠道中已配置定价的模型
+    rows = conn.execute("""
+        SELECT cmp.model_name, cmp.resolution, cmp.selling_price, cmp.points_per_second,
+               ch.name AS channel_name, ch.id AS channel_id
+        FROM channel_model_pricing cmp
+        JOIN channels ch ON ch.id = cmp.channel_id
+        WHERE ch.status = 'active'
+        ORDER BY cmp.model_name, cmp.resolution
+    """).fetchall()
+
+    conn.close()
+
+    zone_map = {"天翼云": "ZoneA", "百度云": "ZoneB"}
+    # 按基础模型名分组，收集分辨率及对应价格
+    model_groups = {}
+    for r in rows:
+        mname = r["model_name"]
+        if mname in disabled_set:
+            continue
+        if mname not in model_groups:
+            model_groups[mname] = {
+                "modelName": mname,
+                "channel_id": r["channel_id"],
+                "channel_name": zone_map.get(r["channel_name"], r["channel_name"]),
+                "resolutions": [],
+            }
+        res = r["resolution"] or ""
+        sp = float(r["selling_price"] or r["points_per_second"] or 0)
+        model_groups[mname]["resolutions"].append({
+            "resolution": res,
+            "selling_price": sp,
+        })
+
+    # 只保留有分辨率 + 已定价的模型
+    all_models = []
+    for mg in model_groups.values():
+        # 过滤：有分辨率 且 selling_price > 0
+        resolutions = [r for r in mg["resolutions"] if r["resolution"] and r["selling_price"] > 0]
+        if not resolutions:
+            continue  # 无可用的分辨率，不展示
+        mg["resolutions"] = resolutions
+        all_models.append(mg)
+
+    return jsonify({"code": 0, "models": all_models})
+
+
+@app.route("/api/generate", methods=["POST"])
+def generate():
+    data = request.get_json(silent=True) or {}
+    model      = (data.get("model") or "").strip()
+    resolution = (data.get("resolution") or "").strip()
+    messages   = data.get("messages", [])
+    text       = (data.get("text") or "").strip()
+    duration   = data.get("duration", 0)
+    ratio    = data.get("ratio", "16:9")
+    image_url = (data.get("image_url") or "").strip()  # 图生视频
+    if image_url and image_url.startswith("/"):
+        # 相对URL补全为绝对URL
+        host_url = request.host_url.rstrip("/")
+        image_url = host_url + image_url
+
+    if not messages and text:
+        messages = [{"role": "user", "content": text}]
+    if not model:
+        return jsonify({"code": 400, "message": "请选择模型"}), 400
+    if not messages and not image_url:
+        return jsonify({"code": 400, "message": "请输入内容或上传图片"}), 400
+    if not duration or int(duration) < 4:
+        return jsonify({"code": 400, "message": "请选择视频时长（最少4秒）"}), 400
+
+    duration = int(duration)
+    uid = session.get("user_id")
+    prompt_text = messages[0].get("content", "")
+
+    # -------- 模型禁用检查 --------
+    if uid:
+        conn_pre = _get_db()
+        role_row = conn_pre.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+        if role_row and role_row["role"] == "account":
+            disabled = conn_pre.execute(
+                "SELECT 1 FROM customer_allowed_models WHERE user_id=? AND model_name=? AND enabled=0",
+                (uid, model)
+            ).fetchone()
+            if disabled:
+                conn_pre.close()
+                return jsonify({"code": 403, "message": f"模型 {model} 已被禁用，请联系销售员开通"}), 403
+        conn_pre.close()
+
+    # -------- 积分预检 --------
+    cost = 0
+    owner_id = None
+    bill_user_id = None
+    points_remaining = 0
+
+    if uid:
+        conn3 = _get_db()
+        user_info = conn3.execute("SELECT owner_id FROM users WHERE id=?", (uid,)).fetchone()
+        owner_id = user_info["owner_id"] if user_info else None
+        bill_user_id = owner_id if owner_id else uid
+
+        settings = conn3.execute("SELECT channel_id FROM user_settings WHERE user_id=?", (uid,)).fetchone()
+        ch_id = settings["channel_id"] if settings else None
+        if ch_id:
+            # model 可能是 API 格式 (doubao-seedance-2-0-720p)，提取基础模型名
+            base_model = model
+            if resolution and model.endswith('-' + resolution.lower()):
+                base_model = model[:-len('-' + resolution.lower())]
+            pricing = conn3.execute(
+                "SELECT selling_price FROM channel_model_pricing WHERE channel_id=? AND model_name=? AND resolution=?",
+                (ch_id, base_model, resolution)
+            ).fetchone()
+            sp = float(pricing["selling_price"]) if pricing and pricing["selling_price"] else 0
+            if sp <= 0:
+                conn3.close()
+                return jsonify({"code": 400, "message": f"模型 {model} 尚未配置定价，请联系管理员"}), 400
+        else:
+            sp = 1.0
+        cost = int(duration * sp)
+
+        bal = conn3.execute("SELECT points FROM user_balance WHERE user_id=?", (bill_user_id,)).fetchone()
+        current_points = bal["points"] if bal else 0
+        if current_points < cost:
+            conn3.close()
+            who = "主账号" if owner_id else "您"
+            return jsonify({"code": 402, "message": f"积分不足！需要 {cost} 积分，{who}当前只有 {current_points} 积分"}), 402
+
+        # 获取渠道信息 — 按基础模型名匹配正确渠道
+        model_ch = conn3.execute(
+            "SELECT ch.id, ch.name, ch.base_url, ch.api_key FROM channels ch "
+            "JOIN channel_model_pricing cmp ON cmp.channel_id = ch.id "
+            "WHERE cmp.model_name=? AND ch.status='active' LIMIT 1",
+            (base_model,)
+        ).fetchone()
+        if model_ch:
+            channel_info = dict(model_ch)
+        else:
+            fb = conn3.execute("SELECT id, name, base_url, api_key FROM channels WHERE status='active' ORDER BY id LIMIT 1").fetchone()
+            if fb:
+                channel_info = dict(fb)
+            else:
+                channel_info = {"name": "天翼云", "base_url": CTYUN_BASE_URL, "id": 1, "api_key": CTYUN_API_KEY}
+        conn3.close()
+    else:
+        # 未登录也按模型匹配渠道
+        conn_fb = _get_db()
+        # model 含分辨率后缀时提取基础名
+        fb_base = model
+        if resolution and model.endswith('-' + resolution.lower()):
+            fb_base = model[:-len('-' + resolution.lower())]
+        model_ch = conn_fb.execute("""
+            SELECT ch.id, ch.name, ch.base_url, ch.api_key FROM channels ch
+            JOIN channel_model_pricing cmp ON cmp.channel_id = ch.id
+            WHERE cmp.model_name=? AND ch.status='active' LIMIT 1
+        """, (fb_base,)).fetchone()
+        if model_ch:
+            channel_info = dict(model_ch)
+        else:
+            fb = conn_fb.execute("SELECT id, name, base_url, api_key FROM channels WHERE status='active' ORDER BY id LIMIT 1").fetchone()
+            if fb:
+                channel_info = dict(fb)
+            else:
+                channel_info = {"name": "天翼云", "base_url": CTYUN_BASE_URL, "id": 1, "api_key": CTYUN_API_KEY}
+        conn_fb.close()
+
+    headers = {"Authorization": f"Bearer {channel_info.get('api_key', '')}", "Content-Type": "application/json"}
+    is_video = "seedance" in model.lower()
+
+    # -------- 根据模型类型调用不同 API --------
+    t1 = time.time()
+    video_url = ""
+    content = ""
+    usage_tokens = 0
+
+    if is_video:
+        # --- 视频生成（天翼云/百度云，异步不阻塞） ---
+        ch_name = channel_info["name"]
+        is_ty = (ch_name == "天翼云")
+        try:
+            if is_ty:
+                # 天翼云: POST /v1/video/generations
+                video_params = {
+                    "model": model,
+                    "prompt": prompt_text,
+                    "metadata": {
+                        "ratio": ratio,
+                        "duration": duration,
+                        "generate_audio": True,
+                        "watermark": False,
+                    }
+                }
+                if image_url:
+                    video_params["image_url"] = image_url
+                video_url_path = "/video/generations"
+                query_url_path = "/video/generations/"
+            else:
+                # 百度云 GoToken: 使用 metadata 传参
+                meta = {
+                    "resolution": data.get("resolution", "720p"),
+                    "ratio": ratio,
+                    "duration": duration,
+                    "watermark": False,
+                    "generate_audio": True,
+                }
+                # 高级参数
+                if data.get("seed") is not None:
+                    meta["seed"] = int(data["seed"])
+                if data.get("service_tier"):
+                    meta["service_tier"] = data["service_tier"]
+                if data.get("return_last_frame"):
+                    meta["return_last_frame"] = True
+                video_params = {"model": model, "prompt": prompt_text, "metadata": meta}
+                # 图生视频：设置 image_url
+                if image_url:
+                    video_params["image_url"] = image_url
+                # 首尾帧
+                if data.get("first_frame_url"):
+                    video_params["first_frame_image"] = data["first_frame_url"]
+                if data.get("last_frame_url"):
+                    video_params["last_frame_image"] = data["last_frame_url"]
+                # 视频生视频：参考视频传入 metadata.content
+                ref_video_url = (data.get("ref_video_url") or "").strip()
+                if ref_video_url and ref_video_url.startswith("/"):
+                    ref_video_url = request.host_url.rstrip("/") + ref_video_url
+                if ref_video_url:
+                    content_list = []
+                    if image_url:
+                        content_list.append({"type": "image_url", "image_url": {"url": image_url}, "role": "first_frame"})
+                    content_list.append({"type": "video_url", "video_url": {"url": ref_video_url}, "role": "reference_video"})
+                    video_params["content"] = content_list
+                video_url_path = "/video/generations"
+                query_url_path = "/video/generations/"
+
+            logger.info("%s提交视频: %s", ch_name, video_params)
+            t_api_start = time.time()
+            resp = requests.post(
+                f"{channel_info['base_url']}{video_url_path}",
+                headers=headers, json=video_params, timeout=60
+            )
+            t_api_end = time.time()
+            backend_req_log = {"url": f"{channel_info['base_url']}{video_url_path}", "method": "POST", "body": video_params}
+            # 先捕获 response body（即使报错也要记录）
+            try:
+                backend_resp_log = resp.json()
+            except:
+                backend_resp_log = {"raw": resp.text[:2000], "status_code": resp.status_code}
+            resp.raise_for_status()
+            submit_result = backend_resp_log
+            remote_task_id = submit_result.get("id") or submit_result.get("task_id", "")
+
+            if not remote_task_id:
+                return jsonify({"code": 502, "message": f"{ch_name}返回异常: {submit_result}"}), 502
+
+            logger.info("%s视频任务已提交: task_id=%s (异步)", ch_name, remote_task_id)
+            elapsed = round(time.time() - t1, 2)
+
+            task_id = str(uuid.uuid4())
+            task_data = {
+                "model": model, "text": prompt_text[:200],
+                "status": "queued",
+                "remote_task_id": remote_task_id,
+                "channel_name": ch_name,
+                "query_url_path": query_url_path,
+                "video_url": "",
+                "content": "",
+                "owner_id": uid,
+                "username": session.get("username", ""),
+                "created_at": time.time(),
+            }
+            _task_store[task_id] = task_data
+            # 持久化到 SQLite
+            _save_task_to_db(task_id, task_data)
+
+            if uid:
+                conn2 = _get_db()
+                if cost > 0 and bill_user_id:
+                    new_points = conn2.execute(
+                        "SELECT points FROM user_balance WHERE user_id=?", (bill_user_id,)
+                    ).fetchone()["points"]
+                    conn2.execute("UPDATE user_balance SET points=points-? WHERE user_id=?", (cost, bill_user_id))
+                    conn2.execute("UPDATE user_balance SET total_points_used=total_points_used+? WHERE user_id=?", (cost, uid))
+                    conn2.execute(
+                        "INSERT INTO points_usage_records (user_id, points_used, balance_after, model_name, duration, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (uid, cost, new_points - cost, model, duration, datetime.now().isoformat()[:19])
+                    )
+                    points_remaining = new_points - cost
+                conn2.execute(
+                    "INSERT INTO usage_records (user_id, channel_id, seconds_used, tokens_used, request_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (uid, channel_info["id"], elapsed, 0, prompt_text[:100], datetime.now().isoformat()[:19])
+                )
+                conn2.commit()
+                conn2.close()
+
+            resp_data = {
+                "code": 0, "task_id": task_id,
+                "remote_task_id": remote_task_id,
+                "status": "queued",
+                "elapsed_seconds": elapsed,
+                "points_used": cost,
+                "points_remaining": points_remaining,
+                "message": f"{ch_name}视频任务已提交 (ID: {remote_task_id})，请稍后查询结果",
+            }
+            _log_request(session.get("username", ""), "generate",
+                         frontend_req=data, backend_req=backend_req_log, backend_resp=backend_resp_log,
+                         response_data=resp_data, status_code=200, duration_ms=int(elapsed * 1000))
+            return jsonify(resp_data)
+
+        except requests.exceptions.RequestException as e:
+            logger.error("%s调用失败: %s", ch_name, e)
+            resp_data = {"code": 502, "message": f"{ch_name} AI 服务调用失败: {e}"}
+            _log_request(session.get("username", ""), "generate",
+                         frontend_req=data, backend_req={"url": f"{channel_info['base_url']}{video_url_path}", "method": "POST", "body": video_params},
+                         response_data=resp_data, status_code=502, duration_ms=int((time.time() - t1) * 1000))
+            return jsonify(resp_data), 502
+    else:
+        # --- 天翼云：Chat Completions ---
+        params = {"model": model, "messages": messages}
+        if data.get("max_tokens"):  params["max_tokens"]  = data["max_tokens"]
+        if data.get("temperature"): params["temperature"] = data["temperature"]
+        if data.get("top_p"):       params["top_p"]       = data["top_p"]
+
+        try:
+            resp = requests.post(
+                f"{channel_info['base_url']}/chat/completions",
+                headers=headers, json=params, timeout=120
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.error("AI网关调用失败: %s", e)
+            return jsonify({"code": 502, "message": f"AI 服务调用失败: {e}"}), 502
+        elapsed = round(time.time() - t1, 2)
+        usage_tokens = result.get("usage", {}).get("total_tokens", 0)
+        choices = result.get("choices", [])
+        content = choices[0].get("message", {}).get("content", "") if choices else ""
+        video_url = _extract_video_url(result)
+
+    # 记录用量 + 积分扣减（API已成功，此时执行）
+    uid = session.get("user_id")
+    if uid:
+        conn2 = _get_db()
+
+        if cost > 0 and bill_user_id:
+            new_points = conn2.execute(
+                "SELECT points FROM user_balance WHERE user_id=?", (bill_user_id,)
+            ).fetchone()["points"]
+            conn2.execute("UPDATE user_balance SET points=points-? WHERE user_id=?", (cost, bill_user_id))
+            conn2.execute("UPDATE user_balance SET total_points_used=total_points_used+? WHERE user_id=?", (cost, uid))
+            conn2.execute(
+                "INSERT INTO points_usage_records (user_id, points_used, balance_after, model_name, duration, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (uid, cost, new_points - cost, model, duration, datetime.now().isoformat()[:19])
+            )
+            points_remaining = new_points - cost
+
+        conn2.execute(
+            "INSERT INTO usage_records (user_id, channel_id, seconds_used, tokens_used, request_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (uid, channel_info["id"], elapsed, usage_tokens, prompt_text[:100],
+             datetime.now().isoformat()[:19])
+        )
+        existing = conn2.execute(
+            "SELECT 1 FROM user_channel_usage WHERE user_id=? AND channel_id=?", (uid, channel_info["id"])
+        ).fetchone()
+        if existing:
+            conn2.execute(
+                "UPDATE user_channel_usage SET total_seconds=total_seconds+? WHERE user_id=? AND channel_id=?",
+                (elapsed, uid, channel_info["id"])
+            )
+        else:
+            conn2.execute(
+                "INSERT INTO user_channel_usage (user_id, channel_id, total_seconds, synced_seconds) VALUES (?, ?, ?, 0)",
+                (uid, channel_info["id"], elapsed)
+            )
+        conn2.commit()
+        conn2.close()
+        logger.info("用量记录: user=%s channel=%s elapsed=%.2fs cost=%spts", uid, channel_info["id"], elapsed, cost)
+
+    task_id = str(uuid.uuid4())
+    task_data = {
+        "model": model, "text": prompt_text[:200],
+        "status": "completed" if video_url else "processing",
+        "video_url": video_url, "content": content, "owner_id": uid,
+        "username": session.get("username", ""),
+        "created_at": time.time(),
+    }
+    _task_store[task_id] = task_data
+    _save_task_to_db(task_id, task_data)
+    return jsonify({
+        "code": 0, "task_id": task_id, "status": _task_store[task_id]["status"],
+        "video_url": video_url, "content": content,
+        "elapsed_seconds": elapsed,
+        "points_used": cost,
+        "points_remaining": points_remaining,
+        "message": "生成完成" if video_url else "文本已生成",
+    })
+
+
+def _extract_video_url(result):
+    choices = result.get("choices", [])
+    if not choices: return ""
+    content = choices[0].get("message", {}).get("content", "")
+    if not content: return ""
+    for pat in [r'https?://[^\s"\'<>]+\.(?:mp4|avi|mov|webm|m3u8)',
+                r'https?://[^\s"\'<>]+video[^\s"\'<>]*',
+                r'https?://[^\s"\'<>]+oss[^\s"\'<>]*']:
+        m = re.search(pat, content, re.IGNORECASE)
+        if m: return m.group(0)
+    return ""
+
+
+@app.route("/api/task/<task_id>", methods=["GET"])
+def query_task(task_id):
+    task = _task_store.get(task_id)
+    # 内存中没有就从数据库恢复
+    if not task:
+        task = _load_task_from_db(task_id)
+        if task:
+            _task_store[task_id] = task  # 回填内存
+
+    # 如果本地没有，尝试从URL参数恢复（前端传入remote_id和channel）
+    if not task:
+        remote_id = request.args.get("remote_id", "")
+        channel = request.args.get("channel", "百度云")
+        if remote_id:
+            task = {
+                "model": "", "text": "", "status": "queued",
+                "remote_task_id": remote_id, "channel_name": channel,
+                "query_url_path": "/videos/" if channel == "百度云" else "/v1/video/generations/",
+                "video_url": "", "content": "", "owner_id": 0,
+                "username": "", "baidu_status": "", "baidu_progress": 0,
+                "created_at": time.time(),
+            }
+    if not task: return jsonify({"code": 404, "message": "任务不存在"}), 404
+
+    # 异步视频任务：实时查一下状态
+    ch_name = task.get("channel_name", "")
+    if ch_name and task.get("remote_task_id"):
+        remote_id = task["remote_task_id"]
+        db = _get_db()
+        ch = db.execute("SELECT base_url, api_key FROM channels WHERE name=?", (ch_name,)).fetchone()
+        db.close()
+        if ch:
+            api_key = ch['api_key'] or os.environ.get("GOGO_API_KEY") or os.environ.get("CTYUN_API_KEY") or ""
+            ch_headers = {"Authorization": f"Bearer {api_key}"}
+            query_url_path = task.get("query_url_path", "/v1/video/generations/")
+            query_url = f"{ch['base_url']}{query_url_path}{remote_id}"
+            try:
+                qr = requests.get(query_url, headers=ch_headers, timeout=8)
+                td = qr.json()
+                inner = td.get("data", td)
+                remote_status = inner.get("status", td.get("status", ""))
+                task["baidu_status"] = remote_status
+                task["baidu_progress"] = td.get("progress", inner.get("progress", 0))
+                # 提取usage token
+                usage = td.get("usage", inner.get("usage", {}))
+                if usage:
+                    task["usage_tokens"] = usage.get("total_tokens", usage.get("completion_tokens", 0))
+
+                # 各种完成/失败状态
+                remote_status_lower = remote_status.lower()
+                done = remote_status_lower in ("completed", "success", "done", "succeeded")
+                failed = remote_status_lower in ("failed", "error", "failure")
+                if done:
+                    # 按优先级提取视频URL
+                    vurl = ""
+                    for field_path in [
+                        ("data", "result_url"),                 # GoToken新格式
+                        ("output", "video_url"),                # GoToken标准格式
+                        ("metadata", "url"),                    # 旧格式
+                        ("result", "video_url"),
+                    ]:
+                        if not vurl:
+                            for src in [inner, td]:
+                                f0 = src.get(field_path[0], {})
+                                if isinstance(f0, dict):
+                                    vurl = f0.get(field_path[1], "")
+                                if vurl: break
+                    if not vurl:
+                        vurl = inner.get("video_url", td.get("video_url", ""))
+                    if not vurl:
+                        vurl = inner.get("result_url", td.get("result_url", ""))
+                    if vurl:
+                        task["result_url"] = vurl
+
+                    # 提取尾帧图片（return_last_frame 时返回）
+                    last_frame_url = ""
+                    for lf_field in ["last_frame_url", "last_frame_image", "last_frame"]:
+                        if not last_frame_url:
+                            lfv = inner.get(lf_field, td.get(lf_field, ""))
+                            if isinstance(lfv, dict):
+                                lfv = lfv.get("url", "")
+                            if lfv and isinstance(lfv, str) and lfv.startswith("http"):
+                                last_frame_url = lfv
+                    if last_frame_url:
+                        task["last_frame_url"] = last_frame_url
+
+                    # 直接用GoToken CDN地址（24h有效），不下载到Render
+                    # 用户可从前端直接下载到本地计算机
+                    local_url = vurl
+                    logger.info("视频CDN地址: %s...", vurl[:60] if vurl else "无")
+
+                    task["status"] = "completed"
+                    task["video_url"] = local_url
+                    _save_task_to_db(task_id, task)  # 持久化
+                    # 自动加入视频库
+                    vid = str(uuid.uuid4())[:8]
+                    video_entry = {
+                        "id": vid, "name": (task.get("text", "") or "AI生成视频")[:40],
+                        "url": local_url, "is_remote": False,
+                        "owner_id": task.get("owner_id", 0),
+                        "prompt_text": task.get("text", ""),
+                        "model_name": task.get("model", ""),
+                        "duration": 5,
+                        "created_at": datetime.now().isoformat()[:10],
+                    }
+                    _video_store.append(video_entry)
+                    _save_video_to_db(video_entry)
+                elif failed:
+                    task["status"] = "failed"
+                    _save_task_to_db(task_id, task)
+            except Exception as poll_err:
+                logger.warning("轮询百度云失败: %s", poll_err)
+
+    return jsonify({"code": 0, "task_id": task_id, "status": task["status"],
+                    "video_url": task.get("video_url", ""), "content": task.get("content", ""),
+                    "last_frame_url": task.get("last_frame_url", ""),
+                    "model": task.get("model", ""),
+                    "usage_tokens": task.get("usage_tokens", 0),
+                    "baidu_status": task.get("baidu_status", ""),
+                    "baidu_progress": task.get("baidu_progress", ""),
+                    "remote_task_id": task.get("remote_task_id", ""),})
+
+
+# ============================================================ #
+#                      用户任务管理                               #
+# ============================================================ #
+
+@app.route("/api/my-tasks", methods=["GET"])
+@login_required
+def api_my_tasks():
+    """返回当前用户的任务列表"""
+    uid = session["user_id"]
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT id, remote_task_id, model, prompt_text, status, video_url,
+               channel_name, created_at
+        FROM tasks WHERE owner_id=? ORDER BY created_at DESC LIMIT 50
+    """, (uid,)).fetchall()
+    conn.close()
+    tasks = []
+    for r in rows:
+        tasks.append({
+            "task_id": r["id"][:16] + "..." if len(r["id"]) > 16 else r["id"],
+            "model": r["model"] or "",
+            "prompt": (r["prompt_text"] or "")[:60],
+            "status": r["status"] or "",
+            "video_url": r["video_url"] or "",
+            "channel": r["channel_name"] or "",
+            "created_at": r["created_at"] or "",
+        })
+    return jsonify({"code": 0, "tasks": tasks})
+
+
+# ============================================================ #
+#                       视频管理                                  #
+# ============================================================ #
+
+@app.route("/api/videos", methods=["GET"])
+def list_videos():
+    # 按用户隔离：主账号看自己+所有子账号，子账号看父账号+同级子账号
+    uid = session.get("user_id", 0)
+    conn = _get_db()
+    # 找到所属"主账号组"
+    user_row = conn.execute("SELECT owner_id FROM users WHERE id=?", (uid,)).fetchone()
+    if user_row and user_row["owner_id"]:
+        group_root = user_row["owner_id"]  # 子账号：以主账号为根
+    else:
+        group_root = uid  # 主账号或无父子关系：以自己为根
+    # 收集组内所有用户ID
+    group_users = [group_root]
+    subs = conn.execute("SELECT id FROM users WHERE owner_id=?", (group_root,)).fetchall()
+    group_users.extend([s["id"] for s in subs])
+    conn.close()
+    filtered = [v for v in _video_store if v.get("owner_id", 0) in group_users]
+    return jsonify({"code": 0, "videos": filtered})
+
+
+@app.route("/api/upload-reference-video", methods=["POST"])
+def upload_ref_video():
+    """上传参考视频（用于视频生视频）"""
+    f = request.files.get("file")
+    if not f: return jsonify({"code": 400, "message": "请选择视频"}), 400
+    if not f.filename.lower().endswith(('.mp4','.avi','.mov','.webm','.mkv')):
+        return jsonify({"code": 400, "message": "仅支持 MP4/AVI/MOV/WebM/MKV"}), 400
+    if f.content_length and f.content_length > 200 * 1024 * 1024:
+        return jsonify({"code": 400, "message": "视频不超过200MB"}), 400
+    fname = f"ref_{uuid.uuid4().hex}_{f.filename}"
+    save_path = os.path.join(os.path.dirname(__file__), "uploads", fname)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    f.save(save_path)
+    url = f"/api/upload-file/{fname}"
+    return jsonify({"code": 0, "url": url, "message": "上传成功"})
+
+
+@app.route("/api/upload-image", methods=["POST"])
+def upload_image():
+    """上传参考图片（用于图生视频）"""
+    f = request.files.get("file")
+    if not f: return jsonify({"code": 400, "message": "请选择图片"}), 400
+    if not f.filename.lower().endswith(('.jpg','.jpeg','.png','.webp','.gif')):
+        return jsonify({"code": 400, "message": "仅支持 JPG/PNG/WebP/GIF"}), 400
+    fname = f"img_{uuid.uuid4().hex}_{f.filename}"
+    save_path = os.path.join(os.path.dirname(__file__), "uploads", fname)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    f.save(save_path)
+    url = f"/api/upload-file/{fname}"
+    return jsonify({"code": 0, "url": url, "message": "上传成功"})
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload_video():
+    f = request.files.get("file")
+    if not f: return jsonify({"code": 400, "message": "请选择文件"}), 400
+    name = request.form.get("name", f.filename.rsplit(".", 1)[0])
+    fname = f"{uuid.uuid4().hex}_{f.filename}"
+    save_path = os.path.join(os.path.dirname(__file__), "uploads", fname)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    f.save(save_path)
+
+    vid = str(uuid.uuid4())[:8]
+    video_entry = {
+        "id": vid, "name": name, "filename": fname,
+        "url": f"/api/upload-file/{fname}", "owner_id": session.get("user_id", 0),
+        "created_at": datetime.now().isoformat()[:10],
+    }
+    _video_store.append(video_entry)
+    _save_video_to_db(video_entry)
+    return jsonify({"code": 0, "video": _video_store[-1], "message": "上传成功"})
+
+
+@app.route("/api/upload-file/<fname>", methods=["GET"])
+def serve_video(fname):
+    return send_from_directory(os.path.join(os.path.dirname(__file__), "uploads"), fname)
+
+
+@app.route("/api/download-video", methods=["GET"])
+def download_video():
+    """代理下载远程视频到本地计算机（流式转发，不存Render磁盘）"""
+    from flask import Response
+    target_url = request.args.get("url", "").strip()
+    if not target_url:
+        return jsonify({"code": 400, "message": "缺少url参数"}), 400
+    try:
+        r = requests.get(target_url, headers={"Referer": "https://gogogotoken.com/"}, timeout=60, stream=True)
+        r.raise_for_status()
+        def generate():
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        resp = Response(generate(), content_type="video/mp4")
+        resp.headers["Content-Disposition"] = "attachment; filename=ai_video.mp4"
+        return resp
+    except requests.exceptions.RequestException as e:
+        return jsonify({"code": 502, "message": f"下载失败: {e}"}), 502
+
+
+@app.route("/api/videos/save-url", methods=["POST"])
+def save_video_url():
+    """将生成的视频URL保存到视频库"""
+    data = request.get_json(silent=True) or {}
+    video_url = (data.get("video_url") or "").strip()
+    name = (data.get("name") or "AI生成视频").strip()
+    if not video_url:
+        return jsonify({"code": 400, "message": "缺少video_url"}), 400
+    vid = str(uuid.uuid4())[:8]
+    video_entry = {
+        "id": vid, "name": name, "filename": "",
+        "url": video_url, "is_remote": True,
+        "owner_id": session.get("user_id", 0),
+        "created_at": datetime.now().isoformat()[:10],
+    }
+    _video_store.append(video_entry)
+    _save_video_to_db(video_entry)
+    return jsonify({"code": 0, "video": _video_store[-1], "message": "已保存"})
+
+
+@app.route("/api/videos/<vid>", methods=["DELETE"])
+def delete_video(vid):
+    global _video_store
+    _video_store = [v for v in _video_store if v["id"] != vid]
+    return jsonify({"code": 0, "message": "已删除"})
+
+
+# ============================================================ #
+#                      素材管理 API                               #
+# ============================================================ #
+
+@app.route("/api/uploads", methods=["GET"])
+def api_uploads():
+    """返回 uploads 目录中所有素材文件"""
+    upload_dir = os.path.join(os.path.dirname(__file__), "uploads")
+    files = []
+    if os.path.isdir(upload_dir):
+        for fname in sorted(os.listdir(upload_dir), reverse=True):
+            fpath = os.path.join(upload_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            fsize = os.path.getsize(fpath)
+            ext = os.path.splitext(fname)[1].lower()
+            is_image = ext in ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.gif', '.heic', '.heif')
+            is_video = ext in ('.mp4', '.mov')
+            if not is_image and not is_video:
+                continue
+            ftype = "image" if is_image else "video"
+            url_path = f"/api/upload-file/{fname}"
+            files.append({"name": fname, "size": fsize, "type": ftype, "url": url_path})
+    return jsonify({"code": 0, "files": files})
+
+
+@app.route("/api/delete-upload/<fname>", methods=["DELETE"])
+@login_required
+def api_delete_upload(fname):
+    """删除上传的文件"""
+    safe = os.path.basename(fname)
+    fpath = os.path.join(os.path.dirname(__file__), "uploads", safe)
+    if os.path.exists(fpath):
+        os.remove(fpath)
+        return jsonify({"code": 0, "message": "已删除"})
+    return jsonify({"code": 404, "message": "文件不存在"}), 404
+
+
+# ============================================================ #
+#                       静态文件                                  #
+# ============================================================ #
+
+@app.route("/<path:filename>")
+def serve_static(filename):
+    return send_from_directory(FRONTEND_DIR, filename)
+
+
+# ============================================================ #
+#                       启动入口                                  #
+# ============================================================ #
+
+def handler(environ, start_response):
+    return app(environ, start_response)
+
+
+# 任务持久化
+def _save_task_to_db(task_id, task_data):
+    try:
+        conn = _get_db()
+        conn.execute("""
+            INSERT OR REPLACE INTO tasks (id, remote_task_id, model, prompt_text, status, video_url,
+                channel_name, query_url_path, owner_id, username, baidu_status, baidu_progress, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            task_id,
+            task_data.get("remote_task_id", ""),
+            task_data.get("model", ""),
+            task_data.get("text", "")[:200],
+            task_data.get("status", "queued"),
+            task_data.get("video_url", ""),
+            task_data.get("channel_name", ""),
+            task_data.get("query_url_path", ""),
+            task_data.get("owner_id", 0),
+            task_data.get("username", ""),
+            task_data.get("baidu_status", ""),
+            task_data.get("baidu_progress", 0),
+            task_data.get("created_at", time.time()),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("保存任务到DB失败: %s", e)
+
+
+def _load_task_from_db(task_id):
+    try:
+        conn = _get_db()
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        conn.close()
+        if row:
+            return {
+                "model": row["model"], "text": row["prompt_text"],
+                "status": row["status"], "remote_task_id": row["remote_task_id"],
+                "channel_name": row["channel_name"], "query_url_path": row["query_url_path"],
+                "video_url": row["video_url"], "content": "", "owner_id": row["owner_id"],
+                "username": row["username"], "baidu_status": row["baidu_status"],
+                "baidu_progress": row["baidu_progress"], "created_at": row["created_at"],
+            }
+    except:
+        pass
+    return None
+
+
+# 将视频保存到数据库
+def _save_video_to_db(video):
+    conn = _get_db()
+    # 自动分类
+    prompt = (video.get("text") or video.get("prompt_text") or video.get("name") or "")
+    cat = _detect_category(prompt)
+    conn.execute(
+        "INSERT OR REPLACE INTO videos (id, name, url, is_remote, owner_id, prompt_text, model_name, duration, category, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (video["id"], video.get("name", ""), video.get("url", ""),
+         1 if video.get("is_remote") else 0,
+         video.get("owner_id", 1),
+         prompt[:500],
+         video.get("model_name") or video.get("model", ""),
+         video.get("duration", 0),
+         cat,
+         video.get("created_at", datetime.now().isoformat()[:10]))
+    )
+    conn.commit()
+    conn.close()
+
+def _detect_category(text):
+    """根据提示词自动分类"""
+    t = (text or "").lower()
+    if any(w in t for w in ["短剧", "剧情", "故事", "剧本", "对白", "情节"]): return "短剧"
+    if any(w in t for w in ["解说", "讲解", "介绍", "测评", "旁白"]): return "解说"
+    if any(w in t for w in ["广告", "宣传", "推广", "产品", "品牌"]): return "广告"
+    if any(w in t for w in ["动画", "卡通", "动漫", "二次元", "3d"]): return "动画"
+    if any(w in t for w in ["风景", "自然", "旅行", "城市", "天空"]): return "风景"
+    if any(w in t for w in ["人物", "角色", "人物特写", "肖像"]): return "人物"
+    if any(w in t for w in ["动物", "猫", "狗", "宠物", "野生动物"]): return "动物"
+    return "创意"
+
+# 启动时恢复视频库（从 DB + uploads 目录）
+def _restore_video_store():
+    global _video_store
+    conn = _get_db()
+    db_rows = conn.execute("SELECT * FROM videos ORDER BY created_at DESC").fetchall()
+    conn.close()
+    seen_urls = set()
+    for r in db_rows:
+        seen_urls.add(r["url"])
+        _video_store.append({
+            "id": r["id"], "name": r["name"], "url": r["url"],
+            "is_remote": bool(r["is_remote"]), "owner_id": r["owner_id"],
+            "prompt_text": r["prompt_text"] if "prompt_text" in r.keys() else "",
+            "model_name": r["model_name"] if "model_name" in r.keys() else "",
+            "duration": r["duration"] if "duration" in r.keys() else 0,
+            "category": r["category"] if "category" in r.keys() else "",
+            "created_at": r["created_at"][:10],
+        })
+    # 补充：uploads 目录中有但 DB 中没有的文件
+    upload_dir = os.path.join(os.path.dirname(__file__), "uploads")
+    if os.path.isdir(upload_dir):
+        for fname in sorted(os.listdir(upload_dir)):
+            if fname.startswith("gen_") and fname.endswith(".mp4"):
+                url = f"/api/upload-file/{fname}"
+                if url in seen_urls:
+                    continue
+                vid = str(uuid.uuid4())[:8]
+                video = {
+                    "id": vid, "name": fname.replace("gen_", "").replace(".mp4", "")[:40],
+                    "url": url, "is_remote": False, "owner_id": 1,
+                    "created_at": datetime.now().isoformat()[:10],
+                }
+                _video_store.append(video)
+                _save_video_to_db(video)
+
+_restore_video_store()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT") or os.environ.get("FC_SERVER_PORT", 9000))
+    logger.info("服务启动, 端口 %s, 静态目录 %s", port, FRONTEND_DIR)
+    serve(app, host="0.0.0.0", port=port)

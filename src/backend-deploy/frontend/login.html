@@ -61,6 +61,15 @@
 </div>
 
 <script>
+// 如果已登录则直接跳转
+fetch('/api/me').then(r=>r.json()).then(d=>{
+  if(d.code===0){
+    if(d.user.role==='admin') location.replace('/admin');
+    else if(d.user.role==='sales') location.replace('/sales');
+    else location.replace('/dashboard');
+  }
+}).catch(()=>{});
+
 async function handleLogin(e) {
     e.preventDefault();
     const username = document.getElementById('username').value.trim();

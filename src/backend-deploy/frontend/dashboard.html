@@ -177,9 +177,9 @@ body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; bac
         <div id="gen-image-area" style="display:none;">
           <div style="display:flex;gap:16px;flex-wrap:wrap;">
             <div id="image-upload-zone" style="width:200px;height:150px;border:2px dashed var(--border);border-radius:12px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text3);font-size:13px;text-align:center;transition:.2s;flex-shrink:0;" onclick="document.getElementById('image-file-input').click()">
-              🖼️ 点击上传参考图<br><span style="font-size:11px;">支持 JPG/PNG/WebP</span>
+              🖼️ 点击上传图片<br><span style="font-size:11px;">最多9张 · JPG/PNG/WebP</span>
             </div>
-            <input type="file" id="image-file-input" accept="image/*" style="display:none;" onchange="handleImageUpload(event)">
+            <input type="file" id="image-file-input" accept="image/*" multiple style="display:none;" onchange="handleI2VImages(event)">
             <div style="flex:1;min-width:200px;">
               <textarea id="prompt-input-image" placeholder="描述图片如何生成视频...&#10;&#10;例如：让这只猫在草地上跑起来" style="min-height:130px;"></textarea>
               <div id="image-preview" style="display:none;margin-top:8px;font-size:12px;color:var(--green);"></div>
@@ -619,7 +619,7 @@ function completeProgress(success) {
 // 视频生成
 // ========================================================
 var genMode='text';
-var uploadedImageUrl='';
+var i2vFiles=[];
 var v2vFiles={image:[],video:[],audio:[]};
 var v2vUrlFiles={image:[],video:[],audio:[]};
 
@@ -636,6 +636,7 @@ function switchGenMode(mode){
   var advMap={text:'adv-text',image:'adv-image',video:'adv-video'};
   var advEl=document.getElementById(advMap[mode]);if(advEl)advEl.style.display='block';
   if(mode==='video'){v2vFiles={image:[],video:[],audio:[]};v2vUrlFiles={image:[],video:[],audio:[]};document.getElementById('v2v-file-list').style.display='none';document.getElementById('v2v-url-list').style.display='none';}
+  if(mode==='image'){i2vFiles=[];document.getElementById('image-preview').style.display='none';}
 }
 
 function handleV2VUpload(e,type){
@@ -676,9 +677,9 @@ function renderV2VList(){
   if(total===0){list.style.display='none';return;}
   list.style.display='block';
   list.innerHTML='<div style="font-weight:600;margin-bottom:4px;">已添加素材：</div>'
-    +v2vFiles.image.map(function(f,i){return '<div>🖼️ '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(\"image\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
-    +v2vFiles.video.map(function(f,i){return '<div>🎬 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(\"video\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
-    +v2vFiles.audio.map(function(f,i){return '<div>🎵 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(\"audio\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('');
+    +v2vFiles.image.map(function(f,i){return '<div>🖼️ '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;image&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vFiles.video.map(function(f,i){return '<div>🎬 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;video&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vFiles.audio.map(function(f,i){return '<div>🎵 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;audio&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('');
 }
 function removeV2VFile(type,i){v2vFiles[type].splice(i,1);renderV2VList();}
 function addV2VUrl(){
@@ -699,9 +700,9 @@ function renderV2VUrlList(){
   if(total===0){list.style.display='none';return;}
   list.style.display='block';
   list.innerHTML='<div style="font-weight:600;margin-bottom:4px;">网络素材：</div>'
-    +v2vUrlFiles.image.map(function(url,i){return '<div>🖼️ '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(\"image\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
-    +v2vUrlFiles.video.map(function(url,i){return '<div>🎬 '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(\"video\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
-    +v2vUrlFiles.audio.map(function(url,i){return '<div>🎵 '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(\"audio\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('');
+    +v2vUrlFiles.image.map(function(url,i){return '<div>🖼️ '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(&#39;image&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vUrlFiles.video.map(function(url,i){return '<div>🎬 '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(&#39;video&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vUrlFiles.audio.map(function(url,i){return '<div>🎵 '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(&#39;audio&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('');
 }
 function removeV2VUrl(type,i){v2vUrlFiles[type].splice(i,1);renderV2VList();renderV2VUrlList();}
 function handleFrameUpload(e,type){
@@ -715,28 +716,28 @@ function handleFrameUpload(e,type){
   }).catch(function(){toast('上传失败','error');});
 }
 
-function handleImageUpload(e){
-  var file=e.target.files[0];
-  if(!file) return;
-  if(!file.type.startsWith('image/')) return toast('请选择图片文件','error');
-  if(file.size>10*1024*1024) return toast('图片不超过10MB','error');
-
-  // 预览
-  var reader=new FileReader();
-  reader.onload=function(ev){
-    document.getElementById('image-upload-zone').innerHTML='<img src=\"'+ev.target.result+'\" style=\"width:100%;height:100%;object-fit:cover;border-radius:10px;\">';
-  };
-  reader.readAsDataURL(file);
-
-  var form=new FormData(); form.append('file',file);
-  fetch('/api/upload-image',{method:'POST',body:form}).then(r=>r.json()).then(d=>{
-    if(d.code===0){
-      uploadedImageUrl=d.url;
-      document.getElementById('image-preview').style.display='block';
-      document.getElementById('image-preview').textContent='✅ 参考图已上传';
-      document.getElementById('image-upload-zone').style.borderColor='var(--green)';
-    } else toast(d.message||'上传失败','error');
-  }).catch(function(){toast('上传失败','error');});
+function handleI2VImages(e){
+  var files=e.target.files;if(!files||files.length===0)return;
+  if(i2vFiles.length+files.length>9){toast('最多上传9张图片','error');return;}
+  for(var i=0;i<files.length;i++){
+    (function(file){
+      if(!file.type.startsWith('image/')){toast(file.name+' 不是图片','error');return;}
+      if(file.size>30*1024*1024){toast(file.name+' 超过30MB','error');return;}
+      var form=new FormData();form.append('file',file);
+      fetch('/api/upload-image',{method:'POST',body:form}).then(function(r){return r.json();}).then(function(d){
+        if(d.code===0){
+          i2vFiles.push({name:file.name,url:d.url});
+          renderI2VList();
+        }else toast(d.message||'上传失败','error');
+      }).catch(function(){toast('上传失败','error');});
+    })(files[i]);
+  }
+}
+function renderI2VList(){
+  var preview=document.getElementById('image-preview');
+  if(i2vFiles.length===0){preview.style.display='none';return;}
+  preview.style.display='block';
+  preview.innerHTML='已上传 '+i2vFiles.length+' 张：'+i2vFiles.map(function(f,i){return '<span>🖼️ '+esc(f.name)+' <a onclick="i2vFiles.splice('+i+',1);renderI2VList();" style="color:var(--red);cursor:pointer;font-size:10px;">✕</a></span>';}).join(' | ');
 }
 
 function doGenerate(){
@@ -771,8 +772,9 @@ function doGenerate(){
 
   var genBody={model:model,text:prompt,duration:duration,resolution:selectedResolution,ratio:document.getElementById('aspect-ratio').value};
   if(genMode==='image'){
+    if(i2vFiles.length>0) genBody.image_urls=i2vFiles.map(function(f){return f.url;});
     var refImgUrl=document.getElementById('ref-image-url').value.trim();
-    genBody.image_url=uploadedImageUrl||refImgUrl||'';
+    if(refImgUrl){if(!genBody.image_urls)genBody.image_urls=[];genBody.image_urls.push(refImgUrl);}
   }
   // 视频生视频
   if(genMode==='video'){

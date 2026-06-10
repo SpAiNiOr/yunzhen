@@ -221,6 +221,7 @@ body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; bac
           </div>
           <div id="v2v-url-list" style="display:none;margin-bottom:8px;font-size:12px;color:var(--green);"></div>
           <!-- 提示词 -->
+          <div style="font-size:10px;color:var(--text3);margin:4px 0 8px;">ℹ️ 可通过提示词指定参考图片作为首尾帧。若需严格一致，优先使用 <span style="color:var(--accent);">图生视频-首尾帧</span>。</div>
           <textarea id="prompt-input-video" placeholder="描述如何基于参考素材生成新视频..." style="min-height:80px;"></textarea>
         </div>
         <div class="input-row">
@@ -229,6 +230,7 @@ body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; bac
           <div class="param-group"><label>视频时长（秒）</label><input type="number" id="duration" value="5" min="4" max="60" step="1" style="width:80px;" oninput="updateCostPreview()"></div>
           <div class="param-group"><label>预估消耗</label><span style="font-size:20px;font-weight:800;color:var(--accent2);" id="cost-preview">50</span><span style="font-size:12px;color:var(--text3);">积分</span></div>
           <button class="btn btn-accent" id="btn-gen" onclick="doGenerate()">🚀 开始生成</button>
+          <span style="font-size:11px;color:var(--accent);cursor:pointer;" onclick="document.querySelector('[data-panel=my-tasks]').click()">📋 查看任务 →</span>
         </div>
         <!-- 文生视频 高级设置 -->
         <div class="adv-section" id="adv-text" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;display:block;">

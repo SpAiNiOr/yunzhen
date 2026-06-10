@@ -535,8 +535,14 @@ def _init_db():
         )
         xm_id = _last_row_id(conn, "users")
         conn.execute(
-            "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 0, 0, 0, 0)",
+            "INSERT INTO user_balance (user_id, balance, total_deposit, total_used, points) VALUES (?, 50, 50, 0, 5000)",
             (xm_id,)
+        )
+        # 初始化充值记录
+        admin_id = conn.execute("SELECT id FROM users WHERE role='admin'").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO recharge_records (user_id, amount, balance_before, balance_after, created_by, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (xm_id, 50, 0, 50, admin_id, "初始充值", datetime.now().isoformat()[:19])
         )
         conn.execute(
             "INSERT INTO user_settings (user_id, selected_model, rate_per_second, channel_id, updated_at) VALUES (?, '', 2.30, 2, ?)",
@@ -2212,7 +2218,7 @@ def api_admin_recharge():
         before_bal = bal["balance"]; before_pts = bal["points"]; before_dep = bal["total_deposit"]
 
     after_bal = before_bal + amount
-    after_pts = before_pts + int(amount)
+    after_pts = before_pts + int(amount * 100)
     after_dep = before_dep + amount
 
     conn.execute("UPDATE user_balance SET balance=?, total_deposit=?, points=? WHERE user_id=?",
@@ -2444,7 +2450,7 @@ def generate():
                 return jsonify({"code": 400, "message": f"模型 {model} 尚未配置定价，请联系管理员"}), 400
         else:
             sp = 1.0
-        cost = int(duration * sp)
+        cost = int(duration * sp * 100)
 
         bal = conn3.execute("SELECT points FROM user_balance WHERE user_id=?", (bill_user_id,)).fetchone()
         current_points = bal["points"] if bal else 0
@@ -2542,15 +2548,35 @@ def generate():
                     video_params["first_frame_image"] = data["first_frame_url"]
                 if data.get("last_frame_url"):
                     video_params["last_frame_image"] = data["last_frame_url"]
-                # 视频生视频：参考视频传入 metadata.content
-                ref_video_url = (data.get("ref_video_url") or "").strip()
-                if ref_video_url and ref_video_url.startswith("/"):
-                    ref_video_url = request.host_url.rstrip("/") + ref_video_url
-                if ref_video_url:
-                    content_list = []
-                    if image_url:
-                        content_list.append({"type": "image_url", "image_url": {"url": image_url}, "role": "first_frame"})
-                    content_list.append({"type": "video_url", "video_url": {"url": ref_video_url}, "role": "reference_video"})
+                # 视频生视频：支持多图（最多9）/多视频（最多3）/音频（最多3）
+                image_urls = data.get("image_urls") or []
+                ref_video_urls = data.get("ref_video_urls") or []
+                audio_urls = data.get("audio_urls") or []
+                if (not isinstance(image_urls, list)): image_urls = [image_urls] if image_urls else []
+                if (not isinstance(ref_video_urls, list)): ref_video_urls = [ref_video_urls] if ref_video_urls else []
+                if (not isinstance(audio_urls, list)): audio_urls = [audio_urls] if audio_urls else []
+                # 单个 image_url 也加入
+                if image_url and image_url not in image_urls:
+                    image_urls.insert(0, image_url)
+                # 单个 ref_video_url 也加入
+                single_ref = (data.get("ref_video_url") or "").strip()
+                if single_ref and single_ref.startswith("/"):
+                    single_ref = request.host_url.rstrip("/") + single_ref
+                if single_ref and single_ref not in ref_video_urls:
+                    ref_video_urls.append(single_ref)
+                # 至少 1 个图片或视频
+                has_media = len(image_urls) + len(ref_video_urls) > 0
+                if not has_media:
+                    return jsonify({"code": 400, "message": "至少需要 1 个参考图片或视频"}), 400
+                # 构建 content 数组
+                content_list = []
+                for img_url in image_urls[:9]:
+                    content_list.append({"type": "image_url", "image_url": {"url": img_url}})
+                for vid_url in ref_video_urls[:3]:
+                    content_list.append({"type": "video_url", "video_url": {"url": vid_url}})
+                for aud_url in audio_urls[:3]:
+                    content_list.append({"type": "audio_url", "audio_url": {"url": aud_url}})
+                if content_list:
                     video_params["content"] = content_list
                 video_url_path = "/video/generations"
                 query_url_path = "/video/generations/"
@@ -2995,6 +3021,10 @@ def save_video_url():
     name = (data.get("name") or "AI生成视频").strip()
     if not video_url:
         return jsonify({"code": 400, "message": "缺少video_url"}), 400
+    # 去重：检查是否已存在相同URL
+    for v in _video_store:
+        if v.get("url") == video_url:
+            return jsonify({"code": 0, "message": "已存在"})
     vid = str(uuid.uuid4())[:8]
     video_entry = {
         "id": vid, "name": name, "filename": "",

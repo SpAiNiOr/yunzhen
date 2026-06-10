@@ -183,25 +183,45 @@ body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; bac
             <div style="flex:1;min-width:200px;">
               <textarea id="prompt-input-image" placeholder="描述图片如何生成视频...&#10;&#10;例如：让这只猫在草地上跑起来" style="min-height:130px;"></textarea>
               <div id="image-preview" style="display:none;margin-top:8px;font-size:12px;color:var(--green);"></div>
+              <div style="margin-top:8px;font-size:12px;color:var(--text3);">或输入图片URL：<input type="text" id="ref-image-url" placeholder="https://..." style="background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 8px;font-size:12px;width:100%;box-sizing:border-box;margin-top:4px;"></div>
             </div>
           </div>
         </div>
         <!-- 视频生视频 -->
         <div id="gen-video-area" style="display:none;">
-          <div style="display:flex;gap:16px;flex-wrap:wrap;">
-            <div id="video-ref-upload-zone" style="width:200px;height:150px;border:2px dashed var(--border);border-radius:12px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text3);font-size:13px;text-align:center;transition:.2s;flex-shrink:0;" onclick="document.getElementById('video-ref-input').click()">
-              🎥 上传参考视频<br><span style="font-size:11px;">MP4/MOV · ≤50MB · 2~15秒<br>最多3个 · 总时长≤15秒</span>
+          <!-- 上传区域 -->
+          <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
+            <div onclick="document.getElementById('v2v-img-input').click()" style="width:140px;height:100px;border:2px dashed var(--border);border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;color:var(--text3);font-size:12px;text-align:center;flex-shrink:0;">
+              🖼️ 上传图片<br><span style="font-size:10px;" id="v2v-img-count">0/9</span>
             </div>
-            <input type="file" id="video-ref-input" accept="video/mp4,video/quicktime" multiple style="display:none;" onchange="handleRefVideoUpload(event)">
-            <div style="flex:1;min-width:200px;">
-              <textarea id="prompt-input-video" placeholder="描述如何基于参考视频生成新视频...&#10;&#10;例如：保持这个场景和人物，让他转身微笑" style="min-height:80px;"></textarea>
-              <div style="margin-top:8px;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:12px;color:var(--text3);">或输入参考视频URL：<input type="text" id="ref-video-url" placeholder="https://example.com/video.mp4" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 8px;font-size:12px;width:250px;margin-left:6px;"></div>
-              <div id="ref-video-preview" style="margin-top:8px;font-size:12px;color:var(--green);">
-                <div id="ref-video-list" style="display:none;"></div>
-                <div id="ref-video-total" style="display:none;margin-top:4px;color:var(--accent);"></div>
-              </div>
+            <input type="file" id="v2v-img-input" accept="image/*" multiple style="display:none;" onchange="handleV2VUpload(event,'image')">
+            <div onclick="document.getElementById('v2v-vid-input').click()" style="width:140px;height:100px;border:2px dashed var(--border);border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;color:var(--text3);font-size:12px;text-align:center;flex-shrink:0;">
+              🎬 上传视频<br><span style="font-size:10px;" id="v2v-vid-count">0/3</span>
+            </div>
+            <input type="file" id="v2v-vid-input" accept="video/mp4,video/quicktime" multiple style="display:none;" onchange="handleV2VUpload(event,'video')">
+            <div onclick="document.getElementById('v2v-aud-input').click()" id="v2v-audio-zone" style="width:140px;height:100px;border:2px dashed var(--border);border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;color:var(--text3);font-size:12px;text-align:center;flex-shrink:0;opacity:0.5;">
+              🎵 上传音频<br><span style="font-size:10px;" id="v2v-aud-count">0/3</span>
+            </div>
+            <input type="file" id="v2v-aud-input" accept="audio/*" multiple style="display:none;" onchange="handleV2VUpload(event,'audio')">
+            <div style="flex:1;min-width:200px;font-size:11px;color:var(--text3);padding:8px;" id="v2v-hint">
+              ⚠ 至少需要 1 个参考图片或视频<br>格式：图片 JPG/PNG/HEIC · ≤30MB<br>视频 MP4/MOV · ≤50MB · 2~15秒
             </div>
           </div>
+          <!-- 已上传文件列表 -->
+          <div id="v2v-file-list" style="display:none;margin-bottom:10px;font-size:12px;color:var(--green);"></div>
+          <!-- 网络地址输入 -->
+          <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap;" id="v2v-url-row">
+            <input type="text" id="v2v-url-input" placeholder="输入图片/视频/音频的网络地址" style="flex:1;min-width:220px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;outline:none;">
+            <select id="v2v-url-type" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;">
+              <option value="image">🖼️ 图片</option>
+              <option value="video">🎬 视频</option>
+              <option value="audio">🎵 音频</option>
+            </select>
+            <button class="btn btn-outline btn-sm" onclick="addV2VUrl()" style="font-size:12px;">添加</button>
+          </div>
+          <div id="v2v-url-list" style="display:none;margin-bottom:8px;font-size:12px;color:var(--green);"></div>
+          <!-- 提示词 -->
+          <textarea id="prompt-input-video" placeholder="描述如何基于参考素材生成新视频..." style="min-height:80px;"></textarea>
         </div>
         <div class="input-row">
           <div class="param-group"><label>画面比例</label><select id="aspect-ratio"><option value="16:9" selected>16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option><option value="21:9">21:9</option><option value="4:3">4:3</option><option value="3:4">3:4</option></select></div>
@@ -210,18 +230,46 @@ body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; bac
           <div class="param-group"><label>预估消耗</label><span style="font-size:20px;font-weight:800;color:var(--accent2);" id="cost-preview">50</span><span style="font-size:12px;color:var(--text3);">积分</span></div>
           <button class="btn btn-accent" id="btn-gen" onclick="doGenerate()">🚀 开始生成</button>
         </div>
-        <!-- 高级设置 -->
-        <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
-          <button class="btn btn-outline btn-sm" onclick="var e=document.getElementById('advanced-settings');e.style.display=e.style.display==='none'?'block':'none';" style="font-size:11px;">⚙ 高级设置</button>
-          <div id="advanced-settings" style="display:none;margin-top:10px;">
-            <div class="input-row">
-              <div class="param-group"><label>随机种子</label><input type="number" id="gen-seed" placeholder="留空随机" style="width:100px;"></div>
-              <div class="param-group"><label><input type="checkbox" id="gen-return-last"> 返回尾帧</label></div>
+        <!-- 文生视频 高级设置 -->
+        <div class="adv-section" id="adv-text" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;display:block;">
+          <button class="btn btn-outline btn-sm" onclick="var e=document.getElementById('adv-text-body');e.style.display=e.style.display==='none'?'block':'none';" style="font-size:11px;">⚙ 高级设置</button>
+          <div id="adv-text-body" style="display:none;margin-top:10px;">
+            <div class="param-group"><label>随机种子</label><input type="number" id="gen-seed" placeholder="留空随机" style="width:100px;"></div>
+          </div>
+        </div>
+        <!-- 图生视频 高级设置 -->
+        <div class="adv-section" id="adv-image" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;display:none;">
+          <button class="btn btn-outline btn-sm" onclick="var e=document.getElementById('adv-image-body');e.style.display=e.style.display==='none'?'block':'none';" style="font-size:11px;">⚙ 高级设置（首尾帧）</button>
+          <div id="adv-image-body" style="display:none;margin-top:10px;">
+            <div style="display:flex;gap:12px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:200px;">
+                <label style="font-size:11px;color:var(--text3);">首帧图</label>
+                <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+                  <button class="btn btn-outline btn-sm" onclick="document.getElementById('ff-upload').click()" style="font-size:11px;">📤 上传</button>
+                  <input type="text" id="gen-first-frame" placeholder="或输入URL" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px 8px;font-size:11px;outline:none;min-width:120px;">
+                  <input type="file" id="ff-upload" accept="image/*" style="display:none;" onchange="handleFrameUpload(event,'first')">
+                </div>
+                <div id="ff-preview" style="font-size:10px;color:var(--green);margin-top:2px;"></div>
+              </div>
+              <div style="flex:1;min-width:200px;">
+                <label style="font-size:11px;color:var(--text3);">尾帧图</label>
+                <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+                  <button class="btn btn-outline btn-sm" onclick="document.getElementById('lf-upload').click()" style="font-size:11px;">📤 上传</button>
+                  <input type="text" id="gen-last-frame" placeholder="或输入URL" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px 8px;font-size:11px;outline:none;min-width:120px;">
+                  <input type="file" id="lf-upload" accept="image/*" style="display:none;" onchange="handleFrameUpload(event,'last')">
+                </div>
+                <div id="lf-preview" style="font-size:10px;color:var(--green);margin-top:2px;"></div>
+              </div>
             </div>
-            <div class="input-row" style="margin-top:8px;">
-              <div class="param-group"><label>首帧图URL</label><input type="text" id="gen-first-frame" placeholder="https://..." style="width:220px;"></div>
-              <div class="param-group"><label>尾帧图URL</label><input type="text" id="gen-last-frame" placeholder="https://..." style="width:220px;"></div>
-            </div>
+            <div class="param-group" style="margin-top:8px;"><label><input type="checkbox" id="gen-return-last"> 返回尾帧</label></div>
+          </div>
+        </div>
+        <!-- 视频生视频 高级设置 -->
+        <div class="adv-section" id="adv-video" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;display:none;">
+          <button class="btn btn-outline btn-sm" onclick="var e=document.getElementById('adv-video-body');e.style.display=e.style.display==='none'?'block':'none';" style="font-size:11px;">⚙ 高级设置</button>
+          <div id="adv-video-body" style="display:none;margin-top:10px;">
+            <div class="param-group"><label>随机种子</label><input type="number" id="gen-seed-vid" placeholder="留空随机" style="width:100px;"></div>
+            <div class="param-group" style="margin-top:6px;"><label><input type="checkbox" id="gen-return-last"> 返回尾帧</label></div>
           </div>
         </div>
       </div>
@@ -522,7 +570,7 @@ function saveModel(){
 
 // 定价
 function loadPricing(){ updateCostPreview(); }
-function updateCostPreview(){ const dur=parseInt(document.getElementById('duration').value)||5; const pps=selectedPrice||0; document.getElementById('cost-preview').textContent=Math.round(dur*pps); }
+function updateCostPreview(){ const dur=parseInt(document.getElementById('duration').value)||5; const pps=selectedPrice||0; document.getElementById('cost-preview').textContent=Math.round(dur*pps*100); }
 
 // ========================================================
 // 进度条（模拟）
@@ -570,7 +618,8 @@ function completeProgress(success) {
 // ========================================================
 var genMode='text';
 var uploadedImageUrl='';
-var uploadedRefVideoUrls=[];
+var v2vFiles={image:[],video:[],audio:[]};
+var v2vUrlFiles={image:[],video:[],audio:[]};
 
 function switchGenMode(mode){
   genMode=mode;
@@ -581,38 +630,88 @@ function switchGenMode(mode){
   document.getElementById('gen-text-area').style.display=mode==='text'?'block':'none';
   document.getElementById('gen-image-area').style.display=mode==='image'?'block':'none';
   document.getElementById('gen-video-area').style.display=mode==='video'?'block':'none';
-  var adv=document.getElementById('advanced-settings').parentElement;
-  adv.style.display=mode==='text'?'none':'block';
-  if(mode==='text') document.getElementById('advanced-settings').style.display='none';
+  document.querySelectorAll('.adv-section').forEach(function(el){el.style.display='none';});
+  var advMap={text:'adv-text',image:'adv-image',video:'adv-video'};
+  var advEl=document.getElementById(advMap[mode]);if(advEl)advEl.style.display='block';
+  if(mode==='video'){v2vFiles={image:[],video:[],audio:[]};v2vUrlFiles={image:[],video:[],audio:[]};document.getElementById('v2v-file-list').style.display='none';document.getElementById('v2v-url-list').style.display='none';}
 }
 
-function handleRefVideoUpload(e){
+function handleV2VUpload(e,type){
   var files=e.target.files;if(!files||files.length===0)return;
-  if(uploadedRefVideoUrls.length+files.length>3){toast('最多上传3个参考视频','error');return;}
+  var limits={image:9,video:3,audio:3};
+  var maxSize={image:30*1024*1024,video:50*1024*1024,audio:30*1024*1024};
+  var accept={image:['image/'],video:['video/mp4','video/quicktime'],audio:['audio/']};
+  if(v2vFiles[type].length+files.length>limits[type]){toast(type+'最多上传'+limits[type]+'个','error');return;}
   for(var i=0;i<files.length;i++){
     (function(file){
-      if(!file.type.startsWith('video/')){toast('请选择视频文件','error');return;}
-      if(file.size>50*1024*1024){toast(file.name+' 超过50MB限制','error');return;}
+      var ok=false;
+      for(var j=0;j<accept[type].length;j++){if(file.type.indexOf(accept[type][j].replace('/',''))>=0||file.type.startsWith(accept[type][j])){ok=true;break;}}
+      if(!ok){toast(file.name+' 格式不支持','error');return;}
+      if(file.size>maxSize[type]){toast(file.name+' 超过大小限制','error');return;}
       var form=new FormData();form.append('file',file);
-      fetch('/api/upload-reference-video',{method:'POST',body:form}).then(function(r){return r.json();}).then(function(d){
+      var api=type==='image'?'/api/upload-image':(type==='video'?'/api/upload-reference-video':'/api/upload-reference-video');
+      fetch(api,{method:'POST',body:form}).then(function(r){return r.json();}).then(function(d){
         if(d.code===0){
-          uploadedRefVideoUrls.push({name:file.name,url:d.url,size:file.size});
-          document.getElementById('video-ref-upload-zone').style.borderColor='var(--green)';
-          renderRefVideoList();
+          v2vFiles[type].push({name:file.name,url:d.url||d.video_url,size:file.size});
+          renderV2VList();
         }else toast(d.message||'上传失败','error');
       }).catch(function(){toast('上传失败','error');});
     })(files[i]);
   }
 }
-function renderRefVideoList(){
-  var list=document.getElementById('ref-video-list'),total=document.getElementById('ref-video-total');
-  if(uploadedRefVideoUrls.length===0){list.style.display='none';total.style.display='none';return;}
-  list.style.display='block';total.style.display='block';
-  list.innerHTML='<div style="font-weight:600;margin-bottom:4px;">已上传 '+uploadedRefVideoUrls.length+'/3 个参考视频：</div>'
-    +uploadedRefVideoUrls.map(function(v,i){return '<div style="display:flex;align-items:center;gap:8px;padding:2px 0;"><span>🎬 '+esc(v.name)+' ('+(v.size/1048576).toFixed(1)+' MB)</span><button class="btn btn-outline btn-sm" onclick="removeRefVideo('+i+')" style="font-size:10px;padding:2px 6px;color:var(--red);">✕</button></div>';}).join('');
-  total.textContent='共 '+uploadedRefVideoUrls.length+' 个参考视频（总时长需≤15秒）';
+function renderV2VList(){
+  var total=v2vFiles.image.length+v2vFiles.video.length+v2vFiles.audio.length+v2vUrlFiles.image.length+v2vUrlFiles.video.length+v2vUrlFiles.audio.length;
+  var list=document.getElementById('v2v-file-list');
+  document.getElementById('v2v-img-count').textContent=v2vFiles.image.length+'/9';
+  document.getElementById('v2v-vid-count').textContent=v2vFiles.video.length+'/3';
+  document.getElementById('v2v-aud-count').textContent=v2vFiles.audio.length+'/3';
+  // audio 区：只有上传了图片/视频才启用
+  var hasMedia=v2vFiles.image.length+v2vFiles.video.length+v2vUrlFiles.image.length+v2vUrlFiles.video.length>0;
+  var az=document.getElementById('v2v-audio-zone');
+  az.style.opacity=hasMedia?'1':'0.5';
+  az.style.pointerEvents=hasMedia?'auto':'none';
+  document.getElementById('v2v-hint').innerHTML=hasMedia?'✅ 已添加素材':(total===0?'⚠ 至少需要 1 个参考图片或视频':'⚠ 需要至少 1 个图片或视频才可启用音频');
+  if(total===0){list.style.display='none';return;}
+  list.style.display='block';
+  list.innerHTML='<div style="font-weight:600;margin-bottom:4px;">已添加素材：</div>'
+    +v2vFiles.image.map(function(f,i){return '<div>🖼️ '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(\"image\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vFiles.video.map(function(f,i){return '<div>🎬 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(\"video\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vFiles.audio.map(function(f,i){return '<div>🎵 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(\"audio\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('');
 }
-function removeRefVideo(i){uploadedRefVideoUrls.splice(i,1);renderRefVideoList();}
+function removeV2VFile(type,i){v2vFiles[type].splice(i,1);renderV2VList();}
+function addV2VUrl(){
+  var url=document.getElementById('v2v-url-input').value.trim();
+  var type=document.getElementById('v2v-url-type').value;
+  if(!url){toast('请输入URL','error');return;}
+  var limits={image:9,video:3,audio:3};
+  var total=v2vFiles[type].length+v2vUrlFiles[type].length;
+  if(total>=limits[type]){toast(type+'最多'+limits[type]+'个','error');return;}
+  v2vUrlFiles[type].push(url);
+  document.getElementById('v2v-url-input').value='';
+  renderV2VList();
+  renderV2VUrlList();
+}
+function renderV2VUrlList(){
+  var total=v2vUrlFiles.image.length+v2vUrlFiles.video.length+v2vUrlFiles.audio.length;
+  var list=document.getElementById('v2v-url-list');
+  if(total===0){list.style.display='none';return;}
+  list.style.display='block';
+  list.innerHTML='<div style="font-weight:600;margin-bottom:4px;">网络素材：</div>'
+    +v2vUrlFiles.image.map(function(url,i){return '<div>🖼️ '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(\"image\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vUrlFiles.video.map(function(url,i){return '<div>🎬 '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(\"video\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
+    +v2vUrlFiles.audio.map(function(url,i){return '<div>🎵 '+esc(url).slice(0,60)+'... <button class="btn btn-outline btn-sm" onclick="removeV2VUrl(\"audio\",'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('');
+}
+function removeV2VUrl(type,i){v2vUrlFiles[type].splice(i,1);renderV2VList();renderV2VUrlList();}
+function handleFrameUpload(e,type){
+  var file=e.target.files[0];if(!file)return;
+  var form=new FormData();form.append('file',file);
+  fetch('/api/upload-image',{method:'POST',body:form}).then(function(r){return r.json();}).then(function(d){
+    if(d.code===0){
+      document.getElementById(type==='first'?'gen-first-frame':'gen-last-frame').value=d.url;
+      document.getElementById(type==='first'?'ff-preview':'lf-preview').textContent='✅ '+file.name;
+    }else toast(d.message||'上传失败','error');
+  }).catch(function(){toast('上传失败','error');});
+}
 
 function handleImageUpload(e){
   var file=e.target.files[0];
@@ -657,7 +756,7 @@ function doGenerate(){
   if(!model) return toast('请先选择模型','error');
   if(duration<4||duration>60) return toast('视频时长需在4-60秒之间','error');
   const pps=selectedPrice||0;
-  if(!confirm('确认生成？\n\n模型：'+model+' (清晰度：'+selectedResolution+')\n时长：'+duration+'秒\n预估消耗：'+Math.round(duration*pps)+' 积分\n\n积分会在确认收到请求之后扣除，如果有任何问题请联系客服！')) return;
+  if(!confirm('确认生成？\n\n模型：'+model+' (清晰度：'+selectedResolution+')\n时长：'+duration+'秒\n预估消耗：'+Math.round(duration*pps*100)+' 积分\n\n积分会在确认收到请求之后扣除，如果有任何问题请联系客服！')) return;
 
   // 先开始进度条
   startProgress(selectedResolution);
@@ -669,15 +768,22 @@ function doGenerate(){
   const btn=document.getElementById('btn-gen'); btn.disabled=true; btn.textContent='⏳ 提交中...';
 
   var genBody={model:model,text:prompt,duration:duration,resolution:selectedResolution,ratio:document.getElementById('aspect-ratio').value};
-  if(genMode==='image' && uploadedImageUrl) genBody.image_url=uploadedImageUrl;
+  if(genMode==='image'){
+    var refImgUrl=document.getElementById('ref-image-url').value.trim();
+    genBody.image_url=uploadedImageUrl||refImgUrl||'';
+  }
   // 视频生视频
   if(genMode==='video'){
-    if(uploadedRefVideoUrls.length>0) genBody.ref_video_urls=uploadedRefVideoUrls.map(function(v){return v.url;});
-    var refVidUrl=document.getElementById('ref-video-url').value.trim();
-    if(refVidUrl){if(!genBody.ref_video_urls)genBody.ref_video_urls=[];genBody.ref_video_urls.push(refVidUrl);}
+    if(v2vFiles.image.length>0) genBody.image_urls=v2vFiles.image.map(function(f){return f.url;});
+    if(v2vFiles.video.length>0) genBody.ref_video_urls=v2vFiles.video.map(function(f){return f.url;});
+    if(v2vFiles.audio.length>0) genBody.audio_urls=v2vFiles.audio.map(function(f){return f.url;});
+    // 添加网络地址
+    if(v2vUrlFiles.image.length>0){if(!genBody.image_urls)genBody.image_urls=[];genBody.image_urls=genBody.image_urls.concat(v2vUrlFiles.image);}
+    if(v2vUrlFiles.video.length>0){if(!genBody.ref_video_urls)genBody.ref_video_urls=[];genBody.ref_video_urls=genBody.ref_video_urls.concat(v2vUrlFiles.video);}
+    if(v2vUrlFiles.audio.length>0){if(!genBody.audio_urls)genBody.audio_urls=[];genBody.audio_urls=genBody.audio_urls.concat(v2vUrlFiles.audio);}
   }
-  var seed=document.getElementById('gen-seed').value.trim();
-  if(seed) genBody.seed=parseInt(seed);
+  var seedEl=document.getElementById(genMode==='video'?'gen-seed-vid':'gen-seed');
+  if(seedEl){var seed=seedEl.value.trim();if(seed) genBody.seed=parseInt(seed);}
   if(document.getElementById('gen-return-last').checked) genBody.return_last_frame=true;
   var ff=document.getElementById('gen-first-frame').value.trim();
   if(ff) genBody.first_frame_url=ff;
@@ -716,7 +822,6 @@ function pollForVideo(taskId, quality, prompt, remoteId, channel) {
       if (d.status === 'completed' && d.video_url) {
         completeProgress(true);
         showVideo(d.video_url, prompt, d.model);
-        saveToLibrary(d.video_url, prompt, d.model);
         if(d.last_frame_url) saveToLibrary(d.last_frame_url, prompt+'（尾帧）', d.model);
       } else if (d.status === 'failed') {
         completeProgress(false);

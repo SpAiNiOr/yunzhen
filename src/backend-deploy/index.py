@@ -2578,11 +2578,7 @@ def generate():
                     single_ref = request.host_url.rstrip("/") + single_ref
                 if single_ref and single_ref not in ref_video_urls:
                     ref_video_urls.append(single_ref)
-                # 至少 1 个图片或视频
-                has_media = len(image_urls_all) + len(ref_video_urls) > 0
-                if not has_media:
-                    return jsonify({"code": 400, "message": "至少需要 1 个参考图片或视频"}), 400
-                # 构建 content 数组
+                # 构建 content 数组（仅当有参考素材时）
                 content_list = []
                 for img_url in image_urls_all[:9]:
                     content_list.append({"type": "image_url", "image_url": {"url": img_url}})

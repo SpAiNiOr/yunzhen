@@ -544,12 +544,12 @@ function selectModel(name, el){
       var label=r.resolution;
       qSel.innerHTML+='<option value="'+r.resolution+'" data-price="'+r.selling_price+'">'+label+'</option>';
     });
-    // 自动选第一个作为默认
+    // 默认选480p，没有则选第一个
     if(modelData.resolutions.length>0){
-      var first=modelData.resolutions[0];
-      qSel.value=first.resolution;
-      selectedResolution=first.resolution;
-      selectedPrice=first.selling_price;
+      var def=modelData.resolutions.find(function(r){return r.resolution==='480p';})||modelData.resolutions[0];
+      qSel.value=def.resolution;
+      selectedResolution=def.resolution;
+      selectedPrice=def.selling_price;
     }
   }
   updateConfirmButton(); updateCostPreview();
@@ -684,9 +684,8 @@ function renderV2VList(){
   if(total===0){list.style.display='none';return;}
   list.style.display='block';
   list.innerHTML='<div style="font-weight:600;margin-bottom:4px;">已添加素材：</div>'
-    +v2vFiles.image.map(function(f,i){return '<div>🖼️ '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;image&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
-    +v2vFiles.video.map(function(f,i){return '<div>🎬 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;video&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('')
-    +v2vFiles.audio.map(function(f,i){return '<div>🎵 '+esc(f.name)+' <button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;audio&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);">✕</button></div>';}).join('');
+    +v2vFiles.image.map(function(f,i){return '<div style="display:flex;align-items:center;gap:6px;padding:2px 0;"><img src="'+f.url+'" onclick="event.stopPropagation();previewFile(\''+f.url+'\',\'image\')" style="cursor:pointer;width:36px;height:36px;object-fit:cover;border-radius:4px;border:1px solid var(--border);flex-shrink:0;" title="点击查看大图"><span style="font-size:12px;">'+esc(f.name).slice(0,20)+'</span><button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;image&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);margin-left:auto;">✕</button></div>';}).join('')
+    +v2vFiles.video.map(function(f,i){return '<div style="display:flex;align-items:center;gap:6px;padding:2px 0;"><video src="'+f.url+'" onclick="event.stopPropagation();previewFile(\''+f.url+'\',\'video\')" style="cursor:pointer;width:36px;height:36px;object-fit:cover;border-radius:4px;border:1px solid var(--border);flex-shrink:0;" preload="metadata" muted title="点击播放"></video><span style="font-size:12px;">'+esc(f.name).slice(0,20)+'</span><button class="btn btn-outline btn-sm" onclick="removeV2VFile(&#39;video&#39;,'+i+')" style="font-size:10px;padding:1px 6px;color:var(--red);margin-left:auto;">✕</button></div>';}).join('')
 }
 function removeV2VFile(type,i){v2vFiles[type].splice(i,1);renderV2VList();}
 function addV2VUrl(){
@@ -744,7 +743,10 @@ function renderI2VList(){
   var preview=document.getElementById('image-preview');
   if(i2vFiles.length===0){preview.style.display='none';return;}
   preview.style.display='block';
-  preview.innerHTML='已上传 '+i2vFiles.length+' 张：'+i2vFiles.map(function(f,i){return '<span>🖼️ '+esc(f.name)+' <a onclick="i2vFiles.splice('+i+',1);renderI2VList();" style="color:var(--red);cursor:pointer;font-size:10px;">✕</a></span>';}).join(' | ');
+  preview.innerHTML='已上传 '+i2vFiles.length+' 张：';
+  i2vFiles.forEach(function(f,i){
+    preview.innerHTML+='<span style="display:inline-flex;align-items:center;gap:4px;margin:2px 6px 2px 0;"><img src="'+f.url+'" onclick="event.stopPropagation();previewFile(\''+f.url+'\',\'image\')" style="cursor:pointer;width:28px;height:28px;object-fit:cover;border-radius:3px;border:1px solid var(--border);" title="点击查看大图"><span style="font-size:11px;">'+esc(f.name).slice(0,15)+'</span><a onclick="i2vFiles.splice('+i+',1);renderI2VList();" style="color:var(--red);cursor:pointer;font-size:10px;">✕</a></span>';
+  });
 }
 var i2vUrlFiles=[];
 function addI2VUrl(){

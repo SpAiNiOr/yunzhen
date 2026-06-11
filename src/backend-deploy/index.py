@@ -2502,6 +2502,15 @@ def generate():
     content = ""
     usage_tokens = 0
 
+    # 统一提取多图片数组（图生视频 / 视频生视频共用）
+    image_urls_all = data.get("image_urls") or []
+    if (not isinstance(image_urls_all, list)): image_urls_all = [image_urls_all] if image_urls_all else []
+    # 相对路径转绝对URL
+    host = request.host_url.rstrip("/")
+    image_urls_all = [host + u if u.startswith("/") else u for u in image_urls_all]
+    if image_url and image_url not in image_urls_all:
+        image_urls_all.insert(0, image_url)
+
     if is_video:
         # --- 视频生成（天翼云/百度云，异步不阻塞） ---
         ch_name = channel_info["name"]
@@ -2519,8 +2528,16 @@ def generate():
                         "watermark": False,
                     }
                 }
-                if image_url:
-                    video_params["image_url"] = image_url
+                if len(image_urls_all) == 1:
+                    video_params["image_url"] = image_urls_all[0]
+                elif len(image_urls_all) > 1:
+                    video_params["image_urls"] = image_urls_all
+                if data.get("first_frame_url"):
+                    ff = data["first_frame_url"]
+                    video_params["first_frame_image"] = host + ff if ff.startswith("/") else ff
+                if data.get("last_frame_url"):
+                    lf = data["last_frame_url"]
+                    video_params["last_frame_image"] = host + lf if lf.startswith("/") else lf
                 video_url_path = "/video/generations"
                 query_url_path = "/video/generations/"
             else:
@@ -2540,24 +2557,21 @@ def generate():
                 if data.get("return_last_frame"):
                     meta["return_last_frame"] = True
                 video_params = {"model": model, "prompt": prompt_text, "metadata": meta}
-                # 图生视频：设置 image_url
-                if image_url:
-                    video_params["image_url"] = image_url
                 # 首尾帧
                 if data.get("first_frame_url"):
-                    video_params["first_frame_image"] = data["first_frame_url"]
+                    ff = data["first_frame_url"]
+                    video_params["first_frame_image"] = host + ff if ff.startswith("/") else ff
                 if data.get("last_frame_url"):
-                    video_params["last_frame_image"] = data["last_frame_url"]
+                    lf = data["last_frame_url"]
+                    video_params["last_frame_image"] = host + lf if lf.startswith("/") else lf
                 # 视频生视频：支持多图（最多9）/多视频（最多3）/音频（最多3）
-                image_urls = data.get("image_urls") or []
                 ref_video_urls = data.get("ref_video_urls") or []
                 audio_urls = data.get("audio_urls") or []
-                if (not isinstance(image_urls, list)): image_urls = [image_urls] if image_urls else []
                 if (not isinstance(ref_video_urls, list)): ref_video_urls = [ref_video_urls] if ref_video_urls else []
+                # 相对路径转绝对URL
+                ref_video_urls = [host + u if u.startswith("/") else u for u in ref_video_urls]
+                audio_urls = [host + u if u.startswith("/") else u for u in audio_urls]
                 if (not isinstance(audio_urls, list)): audio_urls = [audio_urls] if audio_urls else []
-                # 单个 image_url 也加入
-                if image_url and image_url not in image_urls:
-                    image_urls.insert(0, image_url)
                 # 单个 ref_video_url 也加入
                 single_ref = (data.get("ref_video_url") or "").strip()
                 if single_ref and single_ref.startswith("/"):
@@ -2565,12 +2579,12 @@ def generate():
                 if single_ref and single_ref not in ref_video_urls:
                     ref_video_urls.append(single_ref)
                 # 至少 1 个图片或视频
-                has_media = len(image_urls) + len(ref_video_urls) > 0
+                has_media = len(image_urls_all) + len(ref_video_urls) > 0
                 if not has_media:
                     return jsonify({"code": 400, "message": "至少需要 1 个参考图片或视频"}), 400
                 # 构建 content 数组
                 content_list = []
-                for img_url in image_urls[:9]:
+                for img_url in image_urls_all[:9]:
                     content_list.append({"type": "image_url", "image_url": {"url": img_url}})
                 for vid_url in ref_video_urls[:3]:
                     content_list.append({"type": "video_url", "video_url": {"url": vid_url}})
@@ -2657,9 +2671,16 @@ def generate():
 
         except requests.exceptions.RequestException as e:
             logger.error("%s调用失败: %s", ch_name, e)
+            goToken_resp = ""
+            try:
+                if hasattr(e, 'response') and e.response is not None:
+                    goToken_resp = e.response.text[:2000]
+            except:
+                goToken_resp = str(e)[:500]
             resp_data = {"code": 502, "message": f"{ch_name} AI 服务调用失败: {e}"}
             _log_request(session.get("username", ""), "generate",
                          frontend_req=data, backend_req={"url": f"{channel_info['base_url']}{video_url_path}", "method": "POST", "body": video_params},
+                         backend_resp={"goToken_error": goToken_resp} if goToken_resp else None,
                          response_data=resp_data, status_code=502, duration_ms=int((time.time() - t1) * 1000))
             return jsonify(resp_data), 502
     else:
@@ -2678,7 +2699,17 @@ def generate():
             result = resp.json()
         except requests.exceptions.RequestException as e:
             logger.error("AI网关调用失败: %s", e)
-            return jsonify({"code": 502, "message": f"AI 服务调用失败: {e}"}), 502
+            goToken_resp = ""
+            try:
+                if hasattr(e, 'response') and e.response is not None:
+                    goToken_resp = e.response.text[:2000]
+            except:
+                goToken_resp = str(e)[:500]
+            resp_data = {"code": 502, "message": f"AI 服务调用失败: {e}"}
+            _log_request(session.get("username", ""), "generate",
+                         frontend_req=data, backend_resp={"goToken_error": goToken_resp} if goToken_resp else None,
+                         response_data=resp_data, status_code=502, duration_ms=int((time.time() - t1) * 1000))
+            return jsonify(resp_data), 502
         elapsed = round(time.time() - t1, 2)
         usage_tokens = result.get("usage", {}).get("total_tokens", 0)
         choices = result.get("choices", [])
@@ -2883,6 +2914,58 @@ def query_task(task_id):
 # ============================================================ #
 #                      用户任务管理                               #
 # ============================================================ #
+
+@app.route("/api/my-tasks/refresh", methods=["POST"])
+@login_required
+def api_refresh_my_tasks():
+    """刷新当前用户所有排队中/处理中任务的状态"""
+    uid = session["user_id"]
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT id, remote_task_id, channel_name FROM tasks
+        WHERE owner_id=? AND status IN ('queued','processing')
+    """, (uid,)).fetchall()
+    conn.close()
+    refreshed = 0
+    for r in rows:
+        if r["remote_task_id"] and r["channel_name"]:
+            # 构造 query_task 需要的参数
+            task_id = r["id"]
+            ch_name = r["channel_name"]
+            remote_id = r["remote_task_id"]
+            db = _get_db()
+            ch = db.execute("SELECT base_url, api_key FROM channels WHERE name=?", (ch_name,)).fetchone()
+            db.close()
+            if ch:
+                api_key = ch['api_key'] or ""
+                query_url = f"{ch['base_url']}/video/generations/{remote_id}"
+                try:
+                    qr = requests.get(query_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=8)
+                    td = qr.json()
+                    inner = td.get("data", td)
+                    remote_status = inner.get("status", td.get("status", ""))
+                    remote_status_lower = remote_status.lower()
+                    if remote_status_lower in ("completed", "success", "done", "succeeded"):
+                        vurl = inner.get("video_url", td.get("video_url", "")) or inner.get("result_url", td.get("result_url", ""))
+                        _save_task_to_db(task_id, {
+                            "status": "completed", "video_url": vurl,
+                            "remote_task_id": remote_id, "channel_name": ch_name,
+                            "model": "", "text": "", "owner_id": uid, "username": "",
+                            "created_at": time.time()
+                        })
+                        refreshed += 1
+                    elif remote_status_lower in ("failed", "error", "failure"):
+                        _save_task_to_db(task_id, {
+                            "status": "failed", "video_url": "",
+                            "remote_task_id": remote_id, "channel_name": ch_name,
+                            "model": "", "text": "", "owner_id": uid, "username": "",
+                            "created_at": time.time()
+                        })
+                        refreshed += 1
+                except:
+                    pass
+    return jsonify({"code": 0, "refreshed": refreshed})
+
 
 @app.route("/api/my-tasks", methods=["GET"])
 @login_required

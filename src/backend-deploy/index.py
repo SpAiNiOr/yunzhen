@@ -2588,6 +2588,9 @@ def generate():
                     content_list.append({"type": "audio_url", "audio_url": {"url": aud_url}})
                 if content_list:
                     video_params["content"] = content_list
+                # 额外发送 images 字段（string[]）
+                if len(image_urls_all) > 0:
+                    video_params["images"] = image_urls_all[:9]
                 video_url_path = "/video/generations"
                 query_url_path = "/video/generations/"
 

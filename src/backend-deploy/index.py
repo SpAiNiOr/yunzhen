@@ -2401,7 +2401,7 @@ def generate():
         messages = [{"role": "user", "content": text}]
     if not model:
         return jsonify({"code": 400, "message": "请选择模型"}), 400
-    if not messages and not image_url:
+    if not messages and not image_url and not data.get("image_urls"):
         return jsonify({"code": 400, "message": "请输入内容或上传图片"}), 400
     if not duration or int(duration) < 4:
         return jsonify({"code": 400, "message": "请选择视频时长（最少4秒）"}), 400
@@ -2675,7 +2675,7 @@ def generate():
             try:
                 if hasattr(e, 'response') and e.response is not None:
                     goToken_resp = e.response.text[:2000]
-            except:
+            except Exception:
                 goToken_resp = str(e)[:500]
             resp_data = {"code": 502, "message": f"{ch_name} AI 服务调用失败: {e}"}
             _log_request(session.get("username", ""), "generate",
